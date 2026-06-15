@@ -3,13 +3,10 @@ from pathlib import Path
 
 
 # -------------------- TELEGRAM --------------------
-TELEGRAM_BOT_TOKEN = "8850755864:AAEzgR57YBCpGwT7cAnWwr7qh62moLGNYFc"
-
+TELEGRAM_BOT_TOKEN = "your_TELEGRAM_BOT_TOKEN"
 # -------------------- TRADING --------------------
 # Get SSID from your broker's cookies (PocketOption example)
-ACCOUNT_SSID = '42["auth",{"session":"05jjbd4d1p8v4f8va6gl9hcar4","isDemo":1,"uid":99884460,"platform":9,"isFastHistory":true,"isOptimized":true}]'
-
-
+ACCOUNT_SSID = "your_pocket_option_ACCOUNT_SSID"
 DATABASE_PATH = "bot_users.sqlite3"  # SQLite database for per-user broker sessions
 
 
