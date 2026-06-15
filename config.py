@@ -1,12 +1,16 @@
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+load_dotenv()   # This loads variables from .env into os.environ
 
 
 # -------------------- TELEGRAM --------------------
-TELEGRAM_BOT_TOKEN = "your_TELEGRAM_BOT_TOKEN"
+# TELEGRAM_BOT_TOKEN = "your_TELEGRAM_BOT_TOKEN"
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 # -------------------- TRADING --------------------
 # Get SSID from your broker's cookies (PocketOption example)
-ACCOUNT_SSID = "your_pocket_option_ACCOUNT_SSID"
+# ACCOUNT_SSID = "your_pocket_option_ACCOUNT_SSID"
+ACCOUNT_SSID = os.getenv("ACCOUNT_SSID", "YOUR_ACCOUNT_SSID_HERE")
 DATABASE_PATH = "bot_users.sqlite3"  # SQLite database for per-user broker sessions
 
 
