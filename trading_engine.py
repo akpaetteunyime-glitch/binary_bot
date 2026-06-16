@@ -6,7 +6,6 @@ from config import AMOUNT, ASSET, EXPIRY_SECONDS, MARTINGALE_LEVELS, MARTINGALE_
 
 
 class AssetSwitchedException(Exception):
-    """Raised when scanner switches asset – tells candle loop to restart subscription."""
     pass
 
 
@@ -21,6 +20,7 @@ class TradingEngine:
         self.daily_loss = 0.0
         self.trades_today = 0
         self.default_expiry = EXPIRY_SECONDS
+        self.custom_expiry_set = False   # NEW: user has overridden expiry
         self.asset = ASSET
         self.base_amount = AMOUNT
         self.martingale_levels = MARTINGALE_LEVELS
@@ -32,16 +32,11 @@ class TradingEngine:
         self._result_ready_event = asyncio.Event()
         self._result_ready_event.set()
         self.last_candle_time = None
-        self.preferred_assets = []   # set from DB
-
-        # Scanner task (for EMARSI auto‑switch)
+        self.preferred_assets = []
         self._scanner_task: asyncio.Task | None = None
         self.scan_interval = SCAN_INTERVAL_SECONDS
 
-        # Data collector for time‑based strategy (always running)
-        from strategies.time_stat_arbitrage import TimeStatArbitrageStrategy
-        self.data_collector = TimeStatArbitrageStrategy(lookback_days=30, min_trades=5, min_win_rate=0.55)
-
+       
     # ------------------------------------------------------------------
     # Strategy switching
     # ------------------------------------------------------------------
@@ -57,6 +52,9 @@ class TradingEngine:
         elif name == "EMARSI":
             from strategies.ema_rsi_strategy import EMARSIStrategy
             self.strategy = EMARSIStrategy()
+        elif name == "Rotational":
+            from strategies.rotational_strategy import RotationalStrategy
+            self.strategy = RotationalStrategy()
         else:
             raise ValueError(f"Unknown strategy {name}")
         self.strategy_name = name
@@ -135,6 +133,7 @@ class TradingEngine:
             applied.append(f"amount=${self.base_amount:.2f}")
         if "expiry_seconds" in config:
             self.default_expiry = int(config["expiry_seconds"])
+            self.custom_expiry_set = True
             applied.append(f"expiry={self.default_expiry}s")
         if "martingale_levels" in config or "martingale_multiplier" in config:
             self.set_martingale_settings(
@@ -240,10 +239,8 @@ class TradingEngine:
             else:
                 print(f"Unknown outcome '{outcome}' – no message")
 
-            # Record for time‑based data collector (always)
             if hasattr(self, 'data_collector') and self.last_candle_time:
                 self.data_collector.record_trade_result(direction, outcome_lower == 'win', self.last_candle_time)
-            # If the active strategy itself supports recording, do it too
             if hasattr(self.strategy, 'record_trade_result') and self.last_candle_time:
                 self.strategy.record_trade_result(direction, outcome_lower == 'win', self.last_candle_time)
 
@@ -316,6 +313,11 @@ class TradingEngine:
         print(f"[MANUAL] Base amount set to ${new_amount:.2f}")
         return True
 
+    async def set_default_expiry(self, expiry: int):
+        self.default_expiry = expiry
+        self.custom_expiry_set = True
+        print(f"[MANUAL] Expiry set to {expiry}s")
+
     # ------------------------------------------------------------------
     # Candle handling
     # ------------------------------------------------------------------
@@ -326,7 +328,6 @@ class TradingEngine:
             print("[CANDLE] Waiting for previous trade result")
             return
 
-        # Store candle time for strategies that need it
         ts = candle.get('time') or candle.get('timestamp')
         if ts is None:
             self.last_candle_time = datetime.now()
@@ -336,36 +337,37 @@ class TradingEngine:
             else:
                 self.last_candle_time = ts
 
+        # Determine expiry: use custom if set, else strategy's default
+        if self.custom_expiry_set:
+            expiry = self.default_expiry
+        else:
+            if hasattr(self.strategy, "get_expiry"):
+                exp = await self.strategy.get_expiry(candle)
+                expiry = exp if exp is not None else self.default_expiry
+            else:
+                expiry = self.default_expiry
+
         signal = await self.strategy.get_signal(candle)
         if signal:
             self._result_ready_event.clear()
             try:
-                expiry = None
-                if hasattr(self.strategy, "get_expiry"):
-                    exp = self.strategy.get_expiry(candle)
-                    expiry = await exp if asyncio.iscoroutine(exp) else exp
                 await self.place_trade(signal, manual=False, expiry=expiry)
             except Exception as e:
                 print(f"[CANDLE] Trade error: {e}")
                 self._result_ready_event.set()
 
     # ------------------------------------------------------------------
-    # Scanner for EMARSI auto‑switch (optional)
+    # Scanner for EMARSI (unchanged)
     # ------------------------------------------------------------------
     async def _check_asset_condition(self, asset: str) -> bool:
-        """Fetch last 150 candles and test if EMARSI strategy would give a signal."""
         try:
             candles = await self.client.get_candles(asset, 60, 150)
             if not candles or len(candles) < 100:
                 return False
             from strategies.ema_rsi_strategy import EMARSIStrategy
             temp = EMARSIStrategy()
-            last_signal = None
             for c in candles:
-                sig = await temp.get_signal(c)
-                if sig:
-                    last_signal = sig
-            # Only consider last candle's signal
+                await temp.get_signal(c)
             final_signal = await temp.get_signal(candles[-1])
             return final_signal is not None
         except Exception as e:
@@ -384,14 +386,14 @@ class TradingEngine:
                 if self.strategy_name != "EMARSI":
                     await asyncio.sleep(self.scan_interval)
                     continue
-                print("[SCANNER] Scanning for assets meeting EMA+RSI condition...")
+                print("[SCANNER] Scanning for EMA+RSI conditions...")
                 best = await self._select_best_asset()
                 if best and best != self.asset:
-                    print(f"[SCANNER] Switching asset from {self.asset} to {best} (martingale level {self.martingale_level})")
+                    print(f"[SCANNER] Switching to {best}")
                     self.asset = best
                     raise AssetSwitchedException(best)
                 elif best == self.asset:
-                    print("[SCANNER] Current asset still meets condition.")
+                    print("[SCANNER] Current asset still good.")
                 else:
                     print("[SCANNER] No asset meets condition.")
             except AssetSwitchedException:

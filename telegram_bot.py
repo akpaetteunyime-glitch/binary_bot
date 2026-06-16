@@ -1,5 +1,6 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+from config import ASSET_CATEGORIES
 
 session_manager = None
 
@@ -72,7 +73,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Session manager not ready.")
         return
 
-    # Asset selection
+    # ----- Asset selection (from category drill-down) -----
     if data.startswith("asset_"):
         asset = data[6:]
         try:
@@ -85,7 +86,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"Error: {e}")
         return
 
-    # Amount selection
+    # ----- Category selection (when user clicks a category) -----
+    if data.startswith("cat_"):
+        category = data[4:]
+        assets = ASSET_CATEGORIES.get(category, [])
+        if not assets:
+            await query.edit_message_text("No assets in this category.")
+            return
+        rows = []
+        row = []
+        for asset in assets:
+            row.append(InlineKeyboardButton(asset, callback_data=f"asset_{asset}"))
+            if len(row) == 4:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("🔙 Categories", callback_data="change_asset")])
+        rows.append([InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")])
+        await query.edit_message_text(
+            f"📊 *{category} – select asset*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+
+    # ----- Amount selection -----
     if data.startswith("amount_"):
         val = data[7:]
         if val == "custom":
@@ -104,7 +130,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"Error: {e}")
         return
 
-    # Expiry selection
+    # ----- Expiry selection -----
     if data == "set_expiry":
         keyboard = [
             [InlineKeyboardButton("15s", callback_data="expiry_15"),
@@ -139,13 +165,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"Error: {e}")
         return
 
-    # Strategy selection
+    # ----- Strategy selection -----
     if data == "change_strategy":
         keyboard = [
             [InlineKeyboardButton("🌈 Candle Color", callback_data="strategy_CandleColor")],
             [InlineKeyboardButton("📈 MA Crossover", callback_data="strategy_MACrossover")],
             [InlineKeyboardButton("⏰ Time Stat Arbitrage", callback_data="strategy_TimeStatArbitrage")],
-            [InlineKeyboardButton("📊 3 EMA + RSI", callback_data="strategy_EMARSI")],   # NEW BUTTON
+            [InlineKeyboardButton("📊 3 EMA + RSI", callback_data="strategy_EMARSI")],
+            [InlineKeyboardButton("🔄 Rotational", callback_data="strategy_Rotational")],  # NEW
             [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")],
         ]
         await query.edit_message_text(
@@ -155,7 +182,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if data.startswith("strategy_"):
-        strat = data[9:]   # remove "strategy_"
+        strat = data[9:]
         try:
             success = await session_manager.set_strategy(user_id, username, strat)
             if success:
@@ -166,7 +193,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"Error: {e}")
         return
 
-    # Back to main menu
+    # ----- Change Asset (show categories) -----
+    if data == "change_asset":
+        rows = []
+        row = []
+        for category in ASSET_CATEGORIES.keys():
+            row.append(InlineKeyboardButton(category, callback_data=f"cat_{category}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")])
+        await query.edit_message_text(
+            "📊 *Select asset category*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+
+    # ----- Back to main menu -----
     if data == "back_to_main":
         keyboard = [
             [InlineKeyboardButton("🟢 AUTO TRADING ON", callback_data="auto_on")],
@@ -192,7 +238,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Set amount menu
+    # ----- Set amount menu -----
     if data == "set_amount":
         keyboard = [
             [InlineKeyboardButton("$1", callback_data="amount_1"),
@@ -211,7 +257,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Existing handlers (auto_on, auto_off, martingale, presets, etc.)
+    # ----- Existing handlers (auto_on, auto_off, martingale, presets, etc.) -----
     if data == "auto_on":
         try:
             await session_manager.start_auto_trading(user_id, username)
@@ -245,30 +291,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_input"] = "config"
         await query.edit_message_text(
             "📝 Send config lines:\nAMOUNT=1.33\nEXPIRY_SECONDS=60\nMARTINGALE_LEVELS=4\nMARTINGALE_MULTIPLIER=2.2\nASSET=GBPUSD_otc\nMIN_PAYOUT=83\nPREFERRED_ASSETS=EURUSD_otc,GBPUSD_otc\nSSID=your_ssid\nUse /cancelconfig to stop."
-        )
-    elif data == "change_asset":
-        session = await session_manager.ensure_session(user_id, username)
-        if not session:
-            await query.edit_message_text("Please link SSID first.")
-            return
-        assets = session.engine.preferred_assets
-        if not assets:
-            await query.edit_message_text("No preferred assets. Use MANUAL CONFIG to add.")
-            return
-        rows = []
-        row = []
-        for asset in assets:
-            row.append(InlineKeyboardButton(asset, callback_data=f"asset_{asset}"))
-            if len(row) == 4:
-                rows.append(row)
-                row = []
-        if row:
-            rows.append(row)
-        rows.append([InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")])
-        await query.edit_message_text(
-            "📊 *Select asset*\n(Martingale level preserved)",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(rows)
         )
     elif data == "balance":
         try:

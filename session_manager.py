@@ -46,7 +46,6 @@ class SessionManager:
                 engine.preferred_assets = pa
         else:
             engine.preferred_assets = list(PREFERRED_ASSETS)
-        # Load strategy from database
         strat_name = record.get("strategy", "CandleColor")
         engine.set_strategy_by_name(strat_name)
 
@@ -155,9 +154,8 @@ class SessionManager:
                     print(f"Candle for {session.telegram_user_id}: O={candle.get('open')} C={candle.get('close')}")
                     await session.engine.on_candle(candle)
             except AssetSwitchedException as e:
-                # Scanner switched asset – break to restart subscription with new asset
                 print(f"[CANDLE] Asset switched to {e.args[0] if e.args else '?'}. Restarting subscription.")
-                continue   # go to next while iteration, re-subscribe with new asset
+                continue
             except asyncio.TimeoutError:
                 retry_count += 1
                 print(f"[CANDLE] Subscription timeout for {session.engine.asset} (attempt {retry_count}/{max_retries})")
@@ -343,7 +341,8 @@ class SessionManager:
         session = await self.ensure_session(telegram_user_id, username)
         if session is None:
             raise ValueError("Link your SSID first")
-        session.engine.default_expiry = expiry_seconds
+        # The engine method sets the custom expiry flag
+        await session.engine.set_default_expiry(expiry_seconds)
         self.db.update_fields(telegram_user_id, username=username, expiry_seconds=expiry_seconds)
         await self._notify_user(telegram_user_id, f"✅ Expiry time set to {expiry_seconds} seconds")
         return True
