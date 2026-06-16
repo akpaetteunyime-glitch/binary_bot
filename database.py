@@ -38,6 +38,13 @@ class UserDatabase:
                     min_payout INTEGER NOT NULL DEFAULT 83,
                     preferred_assets TEXT,
                     strategy TEXT DEFAULT 'CandleColor',
+                    sessions_enabled INTEGER DEFAULT 0,
+                    sessions_per_day INTEGER DEFAULT 3,
+                    trades_per_session INTEGER DEFAULT 8,
+                    session_start_hour INTEGER DEFAULT 7,
+                    session_wins INTEGER DEFAULT 0,
+                    session_index INTEGER DEFAULT -1,
+                    session_date TEXT,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
@@ -50,6 +57,13 @@ class UserDatabase:
                 ("min_payout", "ALTER TABLE users ADD COLUMN min_payout INTEGER NOT NULL DEFAULT 83"),
                 ("preferred_assets", "ALTER TABLE users ADD COLUMN preferred_assets TEXT"),
                 ("strategy", "ALTER TABLE users ADD COLUMN strategy TEXT DEFAULT 'CandleColor'"),
+                ("sessions_enabled", "ALTER TABLE users ADD COLUMN sessions_enabled INTEGER DEFAULT 0"),
+                ("sessions_per_day", "ALTER TABLE users ADD COLUMN sessions_per_day INTEGER DEFAULT 3"),
+                ("trades_per_session", "ALTER TABLE users ADD COLUMN trades_per_session INTEGER DEFAULT 8"),
+                ("session_start_hour", "ALTER TABLE users ADD COLUMN session_start_hour INTEGER DEFAULT 7"),
+                ("session_wins", "ALTER TABLE users ADD COLUMN session_wins INTEGER DEFAULT 0"),
+                ("session_index", "ALTER TABLE users ADD COLUMN session_index INTEGER DEFAULT -1"),
+                ("session_date", "ALTER TABLE users ADD COLUMN session_date TEXT"),
             ):
                 if column_name not in existing_columns:
                     conn.execute(column_sql)
@@ -100,6 +114,13 @@ class UserDatabase:
             "min_payout": fields.get("min_payout", current.get("min_payout", MIN_PAYOUT)),
             "preferred_assets": fields.get("preferred_assets", current.get("preferred_assets", ",".join(PREFERRED_ASSETS))),
             "strategy": fields.get("strategy", current.get("strategy", "CandleColor")),
+            "sessions_enabled": int(fields.get("sessions_enabled", current.get("sessions_enabled", 0))),
+            "sessions_per_day": int(fields.get("sessions_per_day", current.get("sessions_per_day", 3))),
+            "trades_per_session": int(fields.get("trades_per_session", current.get("trades_per_session", 8))),
+            "session_start_hour": int(fields.get("session_start_hour", current.get("session_start_hour", 7))),
+            "session_wins": int(fields.get("session_wins", current.get("session_wins", 0))),
+            "session_index": int(fields.get("session_index", current.get("session_index", -1))),
+            "session_date": fields.get("session_date", current.get("session_date")),
         }
 
         if isinstance(payload["preferred_assets"], list):
@@ -112,8 +133,11 @@ class UserDatabase:
                     telegram_user_id, username, ssid, asset, amount, expiry_seconds,
                     martingale_levels, martingale_multiplier, martingale_enabled,
                     martingale_level, auto_trading, daily_loss, trades_today,
-                    min_payout, preferred_assets, strategy, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    min_payout, preferred_assets, strategy,
+                    sessions_enabled, sessions_per_day, trades_per_session,
+                    session_start_hour, session_wins, session_index, session_date,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(telegram_user_id) DO UPDATE SET
                     username = excluded.username,
                     ssid = excluded.ssid,
@@ -130,6 +154,13 @@ class UserDatabase:
                     min_payout = excluded.min_payout,
                     preferred_assets = excluded.preferred_assets,
                     strategy = excluded.strategy,
+                    sessions_enabled = excluded.sessions_enabled,
+                    sessions_per_day = excluded.sessions_per_day,
+                    trades_per_session = excluded.trades_per_session,
+                    session_start_hour = excluded.session_start_hour,
+                    session_wins = excluded.session_wins,
+                    session_index = excluded.session_index,
+                    session_date = excluded.session_date,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -149,6 +180,13 @@ class UserDatabase:
                     payload["min_payout"],
                     payload["preferred_assets"],
                     payload["strategy"],
+                    payload["sessions_enabled"],
+                    payload["sessions_per_day"],
+                    payload["trades_per_session"],
+                    payload["session_start_hour"],
+                    payload["session_wins"],
+                    payload["session_index"],
+                    payload["session_date"],
                 ),
             )
 
@@ -163,7 +201,6 @@ class UserDatabase:
         username = merged.pop("username", None)
         self.upsert_user(telegram_user_id, username=username, **merged)
 
-    # ... (rest of the file unchanged: migrate_plaintext_ssids, has_ssid)
     def migrate_plaintext_ssids(self) -> int:
         count = 0
         with self._connect() as conn:

@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 from config import AMOUNT, ASSET, EXPIRY_SECONDS, MARTINGALE_LEVELS, MARTINGALE_MULTIPLIER, SCAN_INTERVAL_SECONDS
 
@@ -20,7 +20,7 @@ class TradingEngine:
         self.daily_loss = 0.0
         self.trades_today = 0
         self.default_expiry = EXPIRY_SECONDS
-        self.custom_expiry_set = False   # NEW: user has overridden expiry
+        self.custom_expiry_set = False
         self.asset = ASSET
         self.base_amount = AMOUNT
         self.martingale_levels = MARTINGALE_LEVELS
@@ -36,7 +36,18 @@ class TradingEngine:
         self._scanner_task: asyncio.Task | None = None
         self.scan_interval = SCAN_INTERVAL_SECONDS
 
+        # Session scheduling
+        self.sessions_enabled = False
+        self.sessions_per_day = 3
+        self.trades_per_session = 8
+        self.session_start_hour = 7
+        self.session_wins = 0
+        self.session_index = -1
+        self.session_date = None
+        self.on_session_state_changed = None   # callback to update DB
+
        
+
     # ------------------------------------------------------------------
     # Strategy switching
     # ------------------------------------------------------------------
@@ -234,6 +245,7 @@ class TradingEngine:
                 if self.martingale_enabled:
                     self._reset_martingale()
                 await self._emit_trade_log(self._format_trade_result_win(amount))
+                await self._record_win()   # session win
             elif outcome_lower == "draw":
                 print("Draw – no message")
             else:
@@ -274,10 +286,115 @@ class TradingEngine:
         print("⏹️ Auto trading DISABLED")
 
     # ------------------------------------------------------------------
+    # Session scheduling methods
+    # ------------------------------------------------------------------
+    def _get_session_schedule(self, dt: datetime):
+        """Return list of (start_time, end_time) for today's sessions."""
+        start_hour = self.session_start_hour
+        if self.sessions_per_day == 3:
+            gap_hours = 5
+        elif self.sessions_per_day == 5:
+            gap_hours = 3
+        elif self.sessions_per_day == 15:
+            gap_hours = 1
+        else:
+            gap_hours = 24 // self.sessions_per_day  # fallback
+
+        base = dt.replace(hour=start_hour, minute=0, second=0, microsecond=0)
+        sessions = []
+        for i in range(self.sessions_per_day):
+            start = base + timedelta(hours=i * gap_hours)
+            end = start + timedelta(minutes=1)   # 1 minute window (but we add 30 seconds grace)
+            sessions.append((start, end + timedelta(seconds=30)))
+        return sessions
+
+    def _get_current_session_index(self, dt: datetime):
+        """Return (index, is_active) where index is 0-based or -1 if none."""
+        sessions = self._get_session_schedule(dt)
+        for i, (start, end) in enumerate(sessions):
+            if start <= dt < end:
+                return i, True
+        return -1, False
+
+    def _reset_session_if_needed(self):
+        today = date.today()
+        if self.session_date != str(today):
+            self.session_wins = 0
+            self.session_index = -1
+            self.session_date = str(today)
+            self._notify_session_state_changed()
+
+    def _notify_session_state_changed(self):
+        if self.on_session_state_changed:
+            try:
+                result = self.on_session_state_changed(self.session_wins, self.session_index, self.session_date)
+                if asyncio.iscoroutine(result):
+                    asyncio.create_task(result)
+            except Exception as e:
+                print(f"[SESSION] DB update error: {e}")
+
+    async def _record_win(self):
+        """Called when a winning trade occurs."""
+        if not self.sessions_enabled:
+            return
+        self._reset_session_if_needed()
+        self.session_wins += 1
+        print(f"[SESSION] Win recorded. {self.session_wins}/{self.trades_per_session} this session.")
+        self._notify_session_state_changed()
+        if self.session_wins >= self.trades_per_session:
+            print(f"[SESSION] Session completed!")
+            await self._emit_trade_log(f"✅ Session completed! {self.session_wins} wins reached.")
+
+    def can_trade(self) -> bool:
+        """Check session limits before placing a trade."""
+        if not self.sessions_enabled:
+            return True
+        dt = datetime.now()
+        self._reset_session_if_needed()
+        idx, active = self._get_current_session_index(dt)
+        if not active:
+            # Check if we are within the next session's start (to start immediately)
+            # We'll just return False if not active, but we could print a message.
+            print("[SESSION] Not in an active session window.")
+            return False
+        if idx != self.session_index:
+            # New session – reset wins
+            self.session_wins = 0
+            self.session_index = idx
+            self._notify_session_state_changed()
+            print(f"[SESSION] New session started. Wins this session: 0/{self.trades_per_session}")
+        if self.session_wins >= self.trades_per_session:
+            print(f"[SESSION] Win limit ({self.trades_per_session}) reached for this session.")
+            return False
+        return True
+
+    async def set_session_settings(self, enabled: bool = None, sessions_per_day: int = None,
+                                  trades_per_session: int = None, start_hour: int = None):
+        if enabled is not None:
+            self.sessions_enabled = enabled
+        if sessions_per_day is not None:
+            self.sessions_per_day = sessions_per_day
+        if trades_per_session is not None:
+            self.trades_per_session = trades_per_session
+        if start_hour is not None:
+            self.session_start_hour = start_hour
+        # Reset session state
+        self.session_wins = 0
+        self.session_index = -1
+        self.session_date = str(date.today())
+        self._notify_session_state_changed()
+        print(f"[SESSION] Settings updated: enabled={self.sessions_enabled}, "
+              f"sessions={self.sessions_per_day}, trades={self.trades_per_session}, start_hour={self.session_start_hour}")
+
+    # ------------------------------------------------------------------
     # Trade execution
     # ------------------------------------------------------------------
     async def place_trade(self, direction: str, manual: bool = False, expiry: int | None = None) -> bool:
         if not manual and not self.auto_trading:
+            return False
+        # Session check for auto trades only
+        if not manual and not self.can_trade():
+            await self._emit_trade_log("⏸️ Trading paused: session limit reached or not in session.")
             return False
         try:
             expiry_value = expiry or self.default_expiry
@@ -357,7 +474,7 @@ class TradingEngine:
                 self._result_ready_event.set()
 
     # ------------------------------------------------------------------
-    # Scanner for EMARSI (unchanged)
+    # Scanner for EMARSI
     # ------------------------------------------------------------------
     async def _check_asset_condition(self, asset: str) -> bool:
         try:

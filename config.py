@@ -46,6 +46,7 @@ ASSET_CATEGORIES = {
         "AUDNZD_otc", "EURNZD_otc", "GBPNZD_otc", "NZDCAD_otc", "CADNOK_otc",
         "EURSEK_otc", "GBPNOK_otc", "AUDCAD_otc", "EURZAR_otc", "USDINR_otc",
         "USDMYR_otc", "USDPHP_otc", "USDRUB_otc", "USDBRL_otc", "USDCLP_otc"
+        "AEDCNY_otc", "MADUSD_otc", "BHDCNY_otc", "NGNUSD_otc", "SARCNY_otc",
     ],
     "Forex Real": [
         "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
