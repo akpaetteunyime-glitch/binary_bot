@@ -3,9 +3,9 @@ class RotationalStrategy:
     Alternating strategy:
     - Trades on every 1‑minute candle.
     - Starts with PUT, then CALL, then PUT, then CALL, ...
-    - Default expiry = 59 seconds (to allow martingale before next candle).
+    - Default expiry = 30 seconds (to allow martingale before next candle).
     """
-    expiry_seconds = 59
+    expiry_seconds = 30
 
     def __init__(self):
         self.trade_count = 0   # number of trades placed so far
