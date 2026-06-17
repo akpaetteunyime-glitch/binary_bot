@@ -1,13 +1,17 @@
 import asyncio
 import sqlite3
 from dataclasses import dataclass
-import datetime
-from datetime import timedelta, date
+from datetime import timedelta, date, datetime
 from contextlib import suppress
 
 from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 
-from config import AMOUNT, ASSET, EXPIRY_SECONDS, MARTINGALE_LEVELS, MARTINGALE_MULTIPLIER, MIN_PAYOUT, PREFERRED_ASSETS
+from config import (
+    AMOUNT, ASSET, EXPIRY_SECONDS, MARTINGALE_LEVELS, MARTINGALE_MULTIPLIER,
+    MIN_PAYOUT, PREFERRED_ASSETS,
+    MIN_PAYOUT_TARGET, PAYOUT_DROP_THRESHOLD, MAX_WICK_RATIO,
+    MIN_TREND_SCORE, SCANNER_CHECK_INTERVAL,
+)
 from database import UserDatabase
 from strategies.candle_strategy import CandleColorStrategy
 from trading_engine import TradingEngine, AssetSwitchedException
@@ -75,7 +79,7 @@ class SessionManager:
         strat_name = record.get("strategy", "CandleColor")
         engine.set_strategy_by_name(strat_name)
 
-        # Load session settings safely
+        # Load session settings
         engine.sessions_enabled = self._safe_bool(record, "sessions_enabled", False)
         engine.sessions_per_day = self._safe_int(record, "sessions_per_day", 3)
         engine.trades_per_session = self._safe_int(record, "trades_per_session", 8)
@@ -84,11 +88,18 @@ class SessionManager:
         engine.session_index = self._safe_int(record, "session_index", -1)
         engine.session_date = self._safe_str(record, "session_date", str(date.today()))
 
+        # Load scanner settings
+        engine.scanner_enabled = self._safe_bool(record, "scanner_enabled", True)
+        engine.min_payout_target = self._safe_float(record, "min_payout_target", MIN_PAYOUT_TARGET)
+        engine.payout_drop_threshold = self._safe_float(record, "payout_drop_threshold", PAYOUT_DROP_THRESHOLD)
+        engine.max_wick_ratio = self._safe_float(record, "max_wick_ratio", MAX_WICK_RATIO)
+        engine.min_trend_score = self._safe_float(record, "min_trend_score", MIN_TREND_SCORE)
+        engine.scanner_check_interval = self._safe_int(record, "scanner_check_interval", SCANNER_CHECK_INTERVAL)
+
         # Set session state callback to update DB
         engine.on_session_state_changed = lambda wins, idx, dt: self._on_session_state_changed(engine, wins, idx, dt)
 
     async def _on_session_state_changed(self, engine: TradingEngine, wins: int, idx: int, dt: str):
-        """Callback from engine to persist session state."""
         if hasattr(engine, '_telegram_user_id'):
             user_id = engine._telegram_user_id
             self.db.update_fields(user_id, session_wins=wins, session_index=idx, session_date=dt)
@@ -101,7 +112,7 @@ class SessionManager:
             client = PocketOptionAsync(ssid=record["ssid"])
             await asyncio.wait_for(client.balance(), timeout=10.0)
             engine = TradingEngine(client)
-            engine._telegram_user_id = telegram_user_id  # store for callback
+            engine._telegram_user_id = telegram_user_id
             engine.set_trade_logger(lambda message: self._notify_user(telegram_user_id, message))
             engine.on_martingale_level_changed = lambda level: self._on_martingale_level_changed(telegram_user_id, level)
             self._apply_record_to_engine(engine, record)
@@ -123,7 +134,6 @@ class SessionManager:
             if username and session.username != username:
                 session.username = username
                 self.db.update_fields(telegram_user_id, username=username)
-            # Ensure _telegram_user_id is always set (in case it was missing)
             if not hasattr(session.engine, '_telegram_user_id'):
                 session.engine._telegram_user_id = telegram_user_id
             return session
@@ -180,19 +190,28 @@ class SessionManager:
                 await session.candle_task
         await session.client.disconnect()
 
+    def _is_asset_not_found_error(self, e: Exception) -> bool:
+        """Check if exception is 'Assets not found' error."""
+        err_msg = str(e).lower()
+        return "assets not found" in err_msg or "not found" in err_msg
+
     async def _run_candles(self, session: UserSession):
         retry_delay = 5
         max_retries = 3
         retry_count = 0
+        asset_not_found_count = 0
+        max_asset_not_found = 3
 
         while session.engine.auto_trading:
             try:
                 current_asset = session.engine.asset
+                print(f"[CANDLE] Subscribing to {current_asset}...")
                 subscription = await asyncio.wait_for(
-                    session.client.subscribe_symbol_time_aligned(current_asset, timedelta(seconds=60)),
+                    session.client.subscribe_symbol_timed(current_asset, timedelta(seconds=60)),
                     timeout=30.0
                 )
                 retry_count = 0
+                asset_not_found_count = 0
                 async for candle in subscription:
                     if not session.engine.auto_trading:
                         break
@@ -216,33 +235,59 @@ class SessionManager:
                 else:
                     await asyncio.sleep(retry_delay)
             except Exception as e:
-                print(f"[CANDLE] Error: {e}")
-                await asyncio.sleep(5)
+                if self._is_asset_not_found_error(e):
+                    asset_not_found_count += 1
+                    print(f"[CANDLE] Asset not found error for {session.engine.asset} (count {asset_not_found_count}/{max_asset_not_found}): {e}")
+                    await self._notify_user(session.telegram_user_id, f"⚠️ Asset {session.engine.asset} not found on broker. Finding fallback...")
+                    if asset_not_found_count >= max_asset_not_found:
+                        print(f"[CANDLE] Too many 'not found' errors. Forcing asset switch...")
+                        new_asset = await self._find_fallback_asset(session)
+                        if new_asset:
+                            await self.set_asset(session.telegram_user_id, session.username, new_asset)
+                            asset_not_found_count = 0
+                        else:
+                            print("[CANDLE] No fallback asset available. Stopping auto trading.")
+                            await self._notify_user(session.telegram_user_id, "❌ No valid assets available. Stopping auto trading.")
+                            await self.stop_auto_trading(session.telegram_user_id, persist=True)
+                            break
+                    else:
+                        await asyncio.sleep(retry_delay)
+                else:
+                    print(f"[CANDLE] Error: {e}")
+                    await asyncio.sleep(5)
 
     async def _find_fallback_asset(self, session: UserSession) -> str | None:
+        print(f"[CANDLE] Finding fallback asset from {len(session.engine.preferred_assets)} candidates...")
         for candidate in session.engine.preferred_assets:
             if candidate == session.engine.asset:
                 continue
             try:
-                test = await asyncio.wait_for(
-                    session.client.subscribe_symbol_time_aligned(candidate, timedelta(seconds=60)),
-                    timeout=10.0
-                )
-                async for _ in test:
-                    await test.aclose()
+                # Validate with payout first
+                payout = await session.client.payout(candidate)
+                if payout and float(payout) > 0:
+                    print(f"[CANDLE] Fallback found: {candidate} (payout: {payout}%)")
                     return candidate
-            except:
+            except Exception as e:
+                if "not found" not in str(e).lower():
+                    print(f"[CANDLE] Fallback check failed for {candidate}: {e}")
                 continue
+        print("[CANDLE] No fallback asset found")
         return None
 
     async def start_auto_trading(self, telegram_user_id: int, username: str | None = None, persist: bool = True):
         session = await self.ensure_session(telegram_user_id, username)
         if session is None:
             raise ValueError("Link your SSID first")
+
+        # FIX: Always ensure engine.start_auto_trading() is called to init scanner
+        # even if auto_trading flag is already True from DB restore
         if session.engine.auto_trading:
+            print(f"[SESSION] Auto trading already enabled for {telegram_user_id}. Ensuring scanner is running...")
+            session.engine.start_auto_trading()  # Re-init scanner if needed
             if session.candle_task is None or session.candle_task.done():
                 session.candle_task = asyncio.create_task(self._run_candles(session))
             return
+
         session.engine.start_auto_trading()
         if persist:
             self.db.update_fields(telegram_user_id, username=username, auto_trading=1)
@@ -353,6 +398,12 @@ class SessionManager:
             "session_start_hour": session.engine.session_start_hour if session else int(record.get("session_start_hour", 7)),
             "session_wins": session.engine.session_wins if session else int(record.get("session_wins", 0)),
             "session_date": session.engine.session_date if session else record.get("session_date", str(date.today())),
+            "scanner_enabled": session.engine.scanner_enabled if session else bool(record.get("scanner_enabled", 1)),
+            "min_payout_target": session.engine.min_payout_target if session else float(record.get("min_payout_target", MIN_PAYOUT_TARGET)),
+            "payout_drop_threshold": session.engine.payout_drop_threshold if session else float(record.get("payout_drop_threshold", PAYOUT_DROP_THRESHOLD)),
+            "max_wick_ratio": session.engine.max_wick_ratio if session else float(record.get("max_wick_ratio", MAX_WICK_RATIO)),
+            "min_trend_score": session.engine.min_trend_score if session else float(record.get("min_trend_score", MIN_TREND_SCORE)),
+            "scanner_check_interval": session.engine.scanner_check_interval if session else int(record.get("scanner_check_interval", SCANNER_CHECK_INTERVAL)),
         }
 
     async def restore_auto_sessions(self):
@@ -369,13 +420,10 @@ class SessionManager:
             try:
                 user_id = int(row["telegram_user_id"])
                 username = row.get("username")
-
-                # If sessions are enabled, verify there is an active window before restoring
                 if row.get("sessions_enabled"):
                     dt = datetime.now()
                     today = str(date.today())
                     session_date = row.get("session_date") or today
-                    # If day rolled over, engine will reset state when started
                     if session_date == today:
                         sessions_per_day = int(row.get("sessions_per_day", 3)) if row.get("sessions_per_day") is not None else 3
                         session_start_hour = int(row.get("session_start_hour", 7)) if row.get("session_start_hour") is not None else 7
@@ -404,10 +452,10 @@ class SessionManager:
                                 break
 
                         if not active:
-                            print(f"[RESTORE] User {user_id} has no active session window. Skipping auto-start.")
+                            print(f"[RESTORE] User {user_id} has no active session window. Skipping.")
                             continue
                         if current_idx == session_index and session_wins >= trades_per_session:
-                            print(f"[RESTORE] User {user_id} current session already completed. Skipping auto-start.")
+                            print(f"[RESTORE] User {user_id} current session already completed. Skipping.")
                             continue
 
                 await self.start_auto_trading(user_id, username, persist=False)
@@ -473,7 +521,6 @@ class SessionManager:
             raise ValueError("Link your SSID first")
         session.engine.sessions_enabled = enabled
         if not enabled:
-            # reset session state
             session.engine.session_wins = 0
             session.engine.session_index = -1
             session.engine.session_date = str(date.today())
@@ -501,7 +548,6 @@ class SessionManager:
             session.engine.trades_per_session = trades_per_session
         if start_hour is not None:
             session.engine.session_start_hour = start_hour
-        # Reset session state
         session.engine.session_wins = 0
         session.engine.session_index = -1
         session.engine.session_date = str(date.today())
@@ -518,4 +564,67 @@ class SessionManager:
         update_fields["session_date"] = str(date.today())
         self.db.update_fields(telegram_user_id, username=username, **update_fields)
         await self._notify_user(telegram_user_id, f"✅ Schedule updated: {session.engine.sessions_per_day} sessions, {session.engine.trades_per_session} wins per session, start at {session.engine.session_start_hour:02d}:00")
+        return True
+
+    # ------------------------------------------------------------------
+    # Asset Scanner settings
+    # ------------------------------------------------------------------
+    async def set_scanner_enabled(self, telegram_user_id: int, username: str | None, enabled: bool) -> bool:
+        session = await self.ensure_session(telegram_user_id, username)
+        if session is None:
+            raise ValueError("Link your SSID first")
+        session.engine.set_scanner_settings(enabled=enabled)
+        self.db.update_fields(telegram_user_id, username=username, scanner_enabled=int(enabled))
+
+        # If enabling and auto trading is already running, restart the scanner
+        if enabled and session.engine.auto_trading:
+            print(f"[SESSION] Scanner enabled while auto trading is active. Restarting scanner...")
+            session.engine.restart_scanner()
+
+        await self._notify_user(telegram_user_id, f"✅ Asset scanner {'ENABLED' if enabled else 'DISABLED'}")
+        return True
+
+    async def set_scanner_settings(
+        self,
+        telegram_user_id: int,
+        username: str | None,
+        min_payout_target: float | None = None,
+        payout_drop_threshold: float | None = None,
+        max_wick_ratio: float | None = None,
+        min_trend_score: float | None = None,
+        check_interval: int | None = None,
+    ) -> bool:
+        session = await self.ensure_session(telegram_user_id, username)
+        if session is None:
+            raise ValueError("Link your SSID first")
+        session.engine.set_scanner_settings(
+            min_payout_target=min_payout_target,
+            payout_drop_threshold=payout_drop_threshold,
+            max_wick_ratio=max_wick_ratio,
+            min_trend_score=min_trend_score,
+            check_interval=check_interval,
+        )
+        update_fields = {}
+        if min_payout_target is not None:
+            update_fields["min_payout_target"] = min_payout_target
+        if payout_drop_threshold is not None:
+            update_fields["payout_drop_threshold"] = payout_drop_threshold
+        if max_wick_ratio is not None:
+            update_fields["max_wick_ratio"] = max_wick_ratio
+        if min_trend_score is not None:
+            update_fields["min_trend_score"] = min_trend_score
+        if check_interval is not None:
+            update_fields["scanner_check_interval"] = check_interval
+        self.db.update_fields(telegram_user_id, username=username, **update_fields)
+
+        # If scanner is already running, restart it to apply new settings
+        if session.engine.scanner_enabled and session.engine.auto_trading:
+            session.engine.restart_scanner()
+
+        await self._notify_user(
+            telegram_user_id,
+            f"✅ Scanner updated: target {session.engine.min_payout_target:.0f}%, "
+            f"drop {session.engine.payout_drop_threshold:.0f}%, wick {session.engine.max_wick_ratio:.2f}, "
+            f"trend {session.engine.min_trend_score:.0f}, interval {session.engine.scanner_check_interval}s"
+        )
         return True

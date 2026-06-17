@@ -3,8 +3,14 @@ from typing import Any
 from pathlib import Path
 from datetime import date
 
-from config import AMOUNT, ASSET, DATABASE_PATH, EXPIRY_SECONDS, MARTINGALE_LEVELS, MARTINGALE_MULTIPLIER, MIN_PAYOUT, PREFERRED_ASSETS
+from config import (
+    AMOUNT, ASSET, DATABASE_PATH, EXPIRY_SECONDS,
+    MARTINGALE_LEVELS, MARTINGALE_MULTIPLIER, MIN_PAYOUT, PREFERRED_ASSETS,
+    ASSET_SCANNER_ENABLED, MIN_PAYOUT_TARGET, PAYOUT_DROP_THRESHOLD,
+    MAX_WICK_RATIO, MIN_TREND_SCORE, SCANNER_CHECK_INTERVAL,
+)
 from ssid_crypto import SSIDCrypto
+
 
 class UserDatabase:
     def __init__(self, db_path: str = DATABASE_PATH):
@@ -45,6 +51,12 @@ class UserDatabase:
                     session_wins INTEGER DEFAULT 0,
                     session_index INTEGER DEFAULT -1,
                     session_date TEXT,
+                    scanner_enabled INTEGER DEFAULT 1,
+                    min_payout_target REAL DEFAULT 92.0,
+                    payout_drop_threshold REAL DEFAULT 85.0,
+                    max_wick_ratio REAL DEFAULT 0.25,
+                    min_trend_score REAL DEFAULT 60.0,
+                    scanner_check_interval INTEGER DEFAULT 30,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
@@ -52,7 +64,8 @@ class UserDatabase:
             )
 
             existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
-            for column_name, column_sql in (
+
+            migrations = [
                 ("ssid", "ALTER TABLE users ADD COLUMN ssid TEXT"),
                 ("min_payout", "ALTER TABLE users ADD COLUMN min_payout INTEGER NOT NULL DEFAULT 83"),
                 ("preferred_assets", "ALTER TABLE users ADD COLUMN preferred_assets TEXT"),
@@ -64,10 +77,19 @@ class UserDatabase:
                 ("session_wins", "ALTER TABLE users ADD COLUMN session_wins INTEGER DEFAULT 0"),
                 ("session_index", "ALTER TABLE users ADD COLUMN session_index INTEGER DEFAULT -1"),
                 ("session_date", "ALTER TABLE users ADD COLUMN session_date TEXT"),
-            ):
+                ("scanner_enabled", "ALTER TABLE users ADD COLUMN scanner_enabled INTEGER DEFAULT 1"),
+                ("min_payout_target", "ALTER TABLE users ADD COLUMN min_payout_target REAL DEFAULT 92.0"),
+                ("payout_drop_threshold", "ALTER TABLE users ADD COLUMN payout_drop_threshold REAL DEFAULT 85.0"),
+                ("max_wick_ratio", "ALTER TABLE users ADD COLUMN max_wick_ratio REAL DEFAULT 0.25"),
+                ("min_trend_score", "ALTER TABLE users ADD COLUMN min_trend_score REAL DEFAULT 60.0"),
+                ("scanner_check_interval", "ALTER TABLE users ADD COLUMN scanner_check_interval INTEGER DEFAULT 30"),
+            ]
+
+            for column_name, column_sql in migrations:
                 if column_name not in existing_columns:
                     conn.execute(column_sql)
 
+            # Encrypt any plaintext SSIDs
             rows_to_encrypt = conn.execute(
                 "SELECT telegram_user_id, ssid FROM users WHERE ssid IS NOT NULL AND ssid != '' AND ssid NOT LIKE 'enc:%'"
             ).fetchall()
@@ -96,99 +118,77 @@ class UserDatabase:
             return result
 
     def upsert_user(self, telegram_user_id: int, username: str | None = None, **fields):
+        """Dynamic upsert that always matches columns to values."""
         current = self.get_user(telegram_user_id) or {}
+
+        def _val(key, default):
+            v = fields.get(key, current.get(key, default))
+            return v if v is not None else default
+
+        # Build payload dict with all columns that exist in the table
         payload = {
             "telegram_user_id": telegram_user_id,
             "username": username if username is not None else current.get("username"),
             "ssid": self.ssid_crypto.encrypt(fields.get("ssid", current.get("ssid"))),
-            "asset": fields.get("asset", current.get("asset", ASSET)),
-            "amount": fields.get("amount", current.get("amount", AMOUNT)),
-            "expiry_seconds": fields.get("expiry_seconds", current.get("expiry_seconds", EXPIRY_SECONDS)),
-            "martingale_levels": fields.get("martingale_levels", current.get("martingale_levels", MARTINGALE_LEVELS)),
-            "martingale_multiplier": fields.get("martingale_multiplier", current.get("martingale_multiplier", MARTINGALE_MULTIPLIER)),
-            "martingale_enabled": int(fields.get("martingale_enabled", current.get("martingale_enabled", 1))),
-            "martingale_level": fields.get("martingale_level", current.get("martingale_level", 0)),
-            "auto_trading": int(fields.get("auto_trading", current.get("auto_trading", 0))),
-            "daily_loss": fields.get("daily_loss", current.get("daily_loss", 0)),
-            "trades_today": fields.get("trades_today", current.get("trades_today", 0)),
-            "min_payout": fields.get("min_payout", current.get("min_payout", MIN_PAYOUT)),
-            "preferred_assets": fields.get("preferred_assets", current.get("preferred_assets", ",".join(PREFERRED_ASSETS))),
-            "strategy": fields.get("strategy", current.get("strategy", "CandleColor")),
-            "sessions_enabled": int(fields.get("sessions_enabled", current.get("sessions_enabled", 0))),
-            "sessions_per_day": int(fields.get("sessions_per_day", current.get("sessions_per_day", 3))),
-            "trades_per_session": int(fields.get("trades_per_session", current.get("trades_per_session", 8))),
-            "session_start_hour": int(fields.get("session_start_hour", current.get("session_start_hour", 7))),
-            "session_wins": int(fields.get("session_wins", current.get("session_wins", 0))),
-            "session_index": int(fields.get("session_index", current.get("session_index", -1))),
-            "session_date": fields.get("session_date", current.get("session_date", str(date.today()))),
+            "asset": _val("asset", ASSET),
+            "amount": _val("amount", AMOUNT),
+            "expiry_seconds": _val("expiry_seconds", EXPIRY_SECONDS),
+            "martingale_levels": _val("martingale_levels", MARTINGALE_LEVELS),
+            "martingale_multiplier": _val("martingale_multiplier", MARTINGALE_MULTIPLIER),
+            "martingale_enabled": int(_val("martingale_enabled", 1)),
+            "martingale_level": _val("martingale_level", 0),
+            "auto_trading": int(_val("auto_trading", 0)),
+            "daily_loss": _val("daily_loss", 0),
+            "trades_today": _val("trades_today", 0),
+            "min_payout": _val("min_payout", MIN_PAYOUT),
+            "preferred_assets": _val("preferred_assets", ",".join(PREFERRED_ASSETS)),
+            "strategy": _val("strategy", "CandleColor"),
+            "sessions_enabled": int(_val("sessions_enabled", 0)),
+            "sessions_per_day": int(_val("sessions_per_day", 3)),
+            "trades_per_session": int(_val("trades_per_session", 8)),
+            "session_start_hour": int(_val("session_start_hour", 7)),
+            "session_wins": int(_val("session_wins", 0)),
+            "session_index": int(_val("session_index", -1)),
+            "session_date": _val("session_date", str(date.today())),
+            "scanner_enabled": int(_val("scanner_enabled", 1 if ASSET_SCANNER_ENABLED else 0)),
+            "min_payout_target": float(_val("min_payout_target", MIN_PAYOUT_TARGET)),
+            "payout_drop_threshold": float(_val("payout_drop_threshold", PAYOUT_DROP_THRESHOLD)),
+            "max_wick_ratio": float(_val("max_wick_ratio", MAX_WICK_RATIO)),
+            "min_trend_score": float(_val("min_trend_score", MIN_TREND_SCORE)),
+            "scanner_check_interval": int(_val("scanner_check_interval", SCANNER_CHECK_INTERVAL)),
         }
 
         if isinstance(payload["preferred_assets"], list):
             payload["preferred_assets"] = ",".join(payload["preferred_assets"])
 
+        # Remove any None SSID encryption issue
+        if payload["ssid"] is None:
+            payload["ssid"] = ""
+
+        # Build dynamic SQL to guarantee column/value match
+        # Exclude updated_at from payload - let DB handle it via CURRENT_TIMESTAMP
+        columns = list(payload.keys())
+        placeholders = ["?" for _ in columns]
+        values = list(payload.values())
+
+        # Remove updated_at from INSERT columns/values - DB handles it
+        if "updated_at" in columns:
+            idx = columns.index("updated_at")
+            # BUG FIX: must pop from ALL THREE lists
+            columns.pop(idx)
+            placeholders.pop(idx)
+            values.pop(idx)
+
+        sql = f"""
+            INSERT INTO users ({', '.join(columns)})
+            VALUES ({', '.join(placeholders)})
+            ON CONFLICT(telegram_user_id) DO UPDATE SET
+                {', '.join(f'{c} = excluded.{c}' for c in columns if c != 'telegram_user_id')},
+                updated_at = CURRENT_TIMESTAMP
+        """
+
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO users (
-                    telegram_user_id, username, ssid, asset, amount, expiry_seconds,
-                    martingale_levels, martingale_multiplier, martingale_enabled,
-                    martingale_level, auto_trading, daily_loss, trades_today,
-                    min_payout, preferred_assets, strategy,
-                    sessions_enabled, sessions_per_day, trades_per_session,
-                    session_start_hour, session_wins, session_index, session_date,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(telegram_user_id) DO UPDATE SET
-                    username = excluded.username,
-                    ssid = excluded.ssid,
-                    asset = excluded.asset,
-                    amount = excluded.amount,
-                    expiry_seconds = excluded.expiry_seconds,
-                    martingale_levels = excluded.martingale_levels,
-                    martingale_multiplier = excluded.martingale_multiplier,
-                    martingale_enabled = excluded.martingale_enabled,
-                    martingale_level = excluded.martingale_level,
-                    auto_trading = excluded.auto_trading,
-                    daily_loss = excluded.daily_loss,
-                    trades_today = excluded.trades_today,
-                    min_payout = excluded.min_payout,
-                    preferred_assets = excluded.preferred_assets,
-                    strategy = excluded.strategy,
-                    sessions_enabled = excluded.sessions_enabled,
-                    sessions_per_day = excluded.sessions_per_day,
-                    trades_per_session = excluded.trades_per_session,
-                    session_start_hour = excluded.session_start_hour,
-                    session_wins = excluded.session_wins,
-                    session_index = excluded.session_index,
-                    session_date = excluded.session_date,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (
-                    payload["telegram_user_id"],
-                    payload["username"],
-                    payload["ssid"],
-                    payload["asset"],
-                    payload["amount"],
-                    payload["expiry_seconds"],
-                    payload["martingale_levels"],
-                    payload["martingale_multiplier"],
-                    payload["martingale_enabled"],
-                    payload["martingale_level"],
-                    payload["auto_trading"],
-                    payload["daily_loss"],
-                    payload["trades_today"],
-                    payload["min_payout"],
-                    payload["preferred_assets"],
-                    payload["strategy"],
-                    payload["sessions_enabled"],
-                    payload["sessions_per_day"],
-                    payload["trades_per_session"],
-                    payload["session_start_hour"],
-                    payload["session_wins"],
-                    payload["session_index"],
-                    payload["session_date"],
-                ),
-            )
+            conn.execute(sql, values)
 
     def update_fields(self, telegram_user_id: int, **fields):
         current = self.get_user(telegram_user_id)
@@ -198,6 +198,8 @@ class UserDatabase:
         merged = dict(current)
         merged.update(fields)
         merged.pop("telegram_user_id", None)
+        merged.pop("created_at", None)  # Don't overwrite created_at
+        merged.pop("updated_at", None)  # Let DB handle updated_at
         username = merged.pop("username", None)
         self.upsert_user(telegram_user_id, username=username, **merged)
 

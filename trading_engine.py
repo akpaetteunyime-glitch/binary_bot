@@ -2,7 +2,13 @@ import asyncio
 from contextlib import suppress
 from datetime import datetime, date, timedelta
 
-from config import AMOUNT, ASSET, EXPIRY_SECONDS, MARTINGALE_LEVELS, MARTINGALE_MULTIPLIER, SCAN_INTERVAL_SECONDS
+from config import (
+    AMOUNT, ASSET, EXPIRY_SECONDS, MARTINGALE_LEVELS, MARTINGALE_MULTIPLIER,
+    SCAN_INTERVAL_SECONDS,
+    MIN_PAYOUT_TARGET, PAYOUT_DROP_THRESHOLD, MAX_WICK_RATIO,
+    MIN_TREND_SCORE, SCANNER_CHECK_INTERVAL,
+)
+from asset_scanner import AssetScanner
 
 class AssetSwitchedException(Exception):
     pass
@@ -42,8 +48,23 @@ class TradingEngine:
         self.session_wins = 0
         self.session_index = -1
         self.session_date = None
-        self.on_session_state_changed = None  # callback to update DB
-        self._all_sessions_done_notified = False  # prevent spam
+        self.on_session_state_changed = None
+        self._all_sessions_done_notified = False
+
+        # Asset scanner
+        self.scanner_enabled = False
+        self.min_payout_target = MIN_PAYOUT_TARGET
+        self.payout_drop_threshold = PAYOUT_DROP_THRESHOLD
+        self.max_wick_ratio = MAX_WICK_RATIO
+        self.min_trend_score = MIN_TREND_SCORE
+        self.scanner_check_interval = SCANNER_CHECK_INTERVAL
+        self.scanner = None
+        self._scanner_start_count = 0
+
+        # Candle timing (kept for compatibility, unused by old on_candle)
+        self._prev_complete_candle: dict | None = None
+        self._current_candle_ts: float | None = None
+        self._event_cleared_at: datetime | None = None
 
     # ------------------------------------------------------------------
     # Strategy switching
@@ -242,7 +263,7 @@ class TradingEngine:
                 if self.martingale_enabled:
                     self._reset_martingale()
                 await self._emit_trade_log(self._format_trade_result_win(amount))
-                await self._record_win()  # session win
+                await self._record_win()
             elif outcome_lower == "draw":
                 print("Draw – no message")
             else:
@@ -258,6 +279,7 @@ class TradingEngine:
             print(f"Result error: {e}")
         finally:
             self._result_ready_event.set()
+            self._event_cleared_at = None
 
     def _track_result_task(self, task: asyncio.Task):
         self.pending_result_tasks.add(task)
@@ -275,7 +297,12 @@ class TradingEngine:
     def start_auto_trading(self):
         self.auto_trading = True
         self._all_sessions_done_notified = False
-        self.start_scanner()
+        print(f"[ENGINE] start_auto_trading called. scanner_enabled={self.scanner_enabled}")
+        if self.scanner_enabled:
+            self._init_scanner()
+            self.start_scanner()
+        else:
+            print("[ENGINE] Scanner is disabled. Skipping scanner start.")
         print("✅ Auto trading ENABLED")
 
     def stop_auto_trading(self):
@@ -284,10 +311,62 @@ class TradingEngine:
         print("⏹️ Auto trading DISABLED")
 
     # ------------------------------------------------------------------
+    # Scanner settings
+    # ------------------------------------------------------------------
+    def _init_scanner(self):
+        print(f"[SCANNER] Initializing scanner: target={self.min_payout_target}%, drop={self.payout_drop_threshold}%, wick={self.max_wick_ratio}, trend={self.min_trend_score}")
+        self.scanner = AssetScanner(
+            self.client,
+            min_payout_target=self.min_payout_target,
+            max_wick_ratio=self.max_wick_ratio,
+            min_trend_score=self.min_trend_score,
+            lookback_candles=20,
+        )
+
+    def set_scanner_settings(
+        self,
+        enabled: bool | None = None,
+        min_payout_target: float | None = None,
+        payout_drop_threshold: float | None = None,
+        max_wick_ratio: float | None = None,
+        min_trend_score: float | None = None,
+        check_interval: int | None = None,
+    ):
+        if enabled is not None:
+            self.scanner_enabled = enabled
+        if min_payout_target is not None:
+            self.min_payout_target = min_payout_target
+        if payout_drop_threshold is not None:
+            self.payout_drop_threshold = payout_drop_threshold
+        if max_wick_ratio is not None:
+            self.max_wick_ratio = max_wick_ratio
+        if min_trend_score is not None:
+            self.min_trend_score = min_trend_score
+        if check_interval is not None:
+            self.scanner_check_interval = check_interval
+        if self.scanner:
+            self.scanner.min_payout_target = self.min_payout_target
+            self.scanner.max_wick_ratio = self.max_wick_ratio
+            self.scanner.min_trend_score = self.min_trend_score
+
+    def restart_scanner(self):
+        print(f"[SCANNER] restart_scanner called. enabled={self.scanner_enabled}, auto_trading={self.auto_trading}")
+        if not self.scanner_enabled:
+            print("[SCANNER] Scanner disabled, not restarting.")
+            return
+        if self.scanner is None:
+            self._init_scanner()
+        self.stop_scanner()
+        if self.auto_trading:
+            self.start_scanner()
+            print("[SCANNER] Scanner restarted.")
+        else:
+            print("[SCANNER] Auto trading is off, scanner not started.")
+
+    # ------------------------------------------------------------------
     # Session scheduling methods
     # ------------------------------------------------------------------
     def _get_session_schedule(self, dt: datetime):
-        """Return list of (start_time, end_time) for today's sessions."""
         start_hour = self.session_start_hour
         if self.sessions_per_day == 3:
             gap_hours = 5
@@ -296,19 +375,17 @@ class TradingEngine:
         elif self.sessions_per_day == 15:
             gap_hours = 1
         else:
-            gap_hours = 24 // self.sessions_per_day  # fallback
+            gap_hours = 24 // self.sessions_per_day
 
         base = dt.replace(hour=start_hour, minute=0, second=0, microsecond=0)
         sessions = []
         for i in range(self.sessions_per_day):
             start = base + timedelta(hours=i * gap_hours)
-            # Each session lasts for the gap duration minus a 5-minute buffer
             end = start + timedelta(hours=gap_hours) - timedelta(minutes=5)
             sessions.append((start, end))
         return sessions
 
     def _get_current_session_index(self, dt: datetime):
-        """Return (index, is_active) where index is 0-based or -1 if none."""
         sessions = self._get_session_schedule(dt)
         for i, (start, end) in enumerate(sessions):
             if start <= dt < end:
@@ -334,7 +411,6 @@ class TradingEngine:
                 print(f"[SESSION] DB update error: {e}")
 
     async def _record_win(self):
-        """Called when a winning trade occurs."""
         if not self.sessions_enabled:
             return
         self._reset_session_if_needed()
@@ -344,7 +420,6 @@ class TradingEngine:
         if self.session_wins >= self.trades_per_session:
             print(f"[SESSION] Session completed!")
             await self._emit_trade_log(f"✅ Session completed! {self.session_wins} wins reached.")
-            # If this was the last session of the day, stop auto trading
             if self.session_index == self.sessions_per_day - 1:
                 print("[SESSION] All daily sessions completed. Stopping auto trading.")
                 if not self._all_sessions_done_notified:
@@ -353,14 +428,12 @@ class TradingEngine:
                 self.stop_auto_trading()
 
     def can_trade(self) -> bool:
-        """Check session limits before placing a trade."""
         if not self.sessions_enabled:
             return True
         dt = datetime.now()
         self._reset_session_if_needed()
         idx, active = self._get_current_session_index(dt)
 
-        # Check if all sessions for today are already done
         if idx == -1 and self.session_index == self.sessions_per_day - 1 and self.session_wins >= self.trades_per_session:
             if not self._all_sessions_done_notified:
                 print("[SESSION] All sessions completed for today.")
@@ -370,7 +443,6 @@ class TradingEngine:
             print("[SESSION] Not in an active session window.")
             return False
         if idx != self.session_index:
-            # New session – reset wins
             self.session_wins = 0
             self.session_index = idx
             self._notify_session_state_changed()
@@ -390,7 +462,6 @@ class TradingEngine:
             self.trades_per_session = trades_per_session
         if start_hour is not None:
             self.session_start_hour = start_hour
-        # Reset session state
         self.session_wins = 0
         self.session_index = -1
         self.session_date = str(date.today())
@@ -400,7 +471,7 @@ class TradingEngine:
               f"sessions={self.sessions_per_day}, trades={self.trades_per_session}, start_hour={self.session_start_hour}")
 
     # ------------------------------------------------------------------
-    # Trade execution
+    # Trade execution  — REVERTED TO WORKING REPO VERSION
     # ------------------------------------------------------------------
     async def place_trade(self, direction: str, manual: bool = False, expiry: int | None = None) -> bool:
         if not manual and not self.auto_trading:
@@ -449,7 +520,7 @@ class TradingEngine:
         print(f"[MANUAL] Expiry set to {expiry}s")
 
     # ------------------------------------------------------------------
-    # Candle handling
+    # Candle handling — REVERTED TO WORKING REPO VERSION
     # ------------------------------------------------------------------
     async def on_candle(self, candle: dict):
         if not self.auto_trading or not self.strategy:
@@ -487,58 +558,77 @@ class TradingEngine:
                 self._result_ready_event.set()
 
     # ------------------------------------------------------------------
-    # Scanner for EMARSI
+    # Universal Asset Scanner
     # ------------------------------------------------------------------
-    async def _check_asset_condition(self, asset: str) -> bool:
-        try:
-            candles = await self.client.get_candles(asset, 60, 150)
-            if not candles or len(candles) < 100:
-                return False
-            from strategies.ema_rsi_strategy import EMARSIStrategy
-            temp = EMARSIStrategy()
-            for c in candles:
-                await temp.get_signal(c)
-            final_signal = await temp.get_signal(candles[-1])
-            return final_signal is not None
-        except Exception as e:
-            print(f"[SCANNER] Error checking {asset}: {e}")
-            return False
-
-    async def _select_best_asset(self) -> str | None:
-        for asset in self.preferred_assets:
-            if await self._check_asset_condition(asset):
-                return asset
-        return None
-
     async def _scanner_loop(self):
+        print(f"[SCANNER] 🔥 Scanner loop STARTED. scanner_enabled={self.scanner_enabled}, interval={self.scanner_check_interval}s")
+        loop_count = 0
         while self.auto_trading:
             try:
-                if self.strategy_name != "EMARSI":
-                    await asyncio.sleep(self.scan_interval)
+                if not self.scanner_enabled or self.scanner is None:
+                    print(f"[SCANNER] Scanner disabled or not initialized. enabled={self.scanner_enabled}, scanner={self.scanner}")
+                    await asyncio.sleep(5)
                     continue
-                print("[SCANNER] Scanning for EMA+RSI conditions...")
-                best = await self._select_best_asset()
-                if best and best != self.asset:
-                    print(f"[SCANNER] Switching to {best}")
-                    self.asset = best
-                    raise AssetSwitchedException(best)
-                elif best == self.asset:
-                    print("[SCANNER] Current asset still good.")
+
+                loop_count += 1
+                if loop_count % 10 == 0:
+                    print(f"[SCANNER] Heartbeat: alive after {loop_count} checks, asset={self.asset}")
+
+                print(f"[SCANNER] [{loop_count}] Checking current asset: {self.asset}")
+                ok, payout, trend_score, wick_score, momentum_score = await self.scanner.check_current_asset(self.asset)
+
+                if ok and payout >= self.min_payout_target:
+                    print(f"[SCANNER] {self.asset} OK | payout={payout:.0f}% trend={trend_score:.0f} wicks={wick_score:.0f} mom={momentum_score:.0f}")
+                    await asyncio.sleep(self.scanner_check_interval)
+                    continue
+
+                print(f"[SCANNER] {self.asset} DEGRADED | payout={payout:.0f}% trend={trend_score:.0f} wicks={wick_score:.0f} mom={momentum_score:.0f}")
+                await self._emit_trade_log(
+                    f"⚠️ {self.asset} degraded (payout {payout:.0f}%, trend {trend_score:.0f}). Scanning for better asset..."
+                )
+
+                print(f"[SCANNER] Scanning {len(self.preferred_assets)} assets for better candidate...")
+                best = await self.scanner.find_best_asset(self.preferred_assets, current_asset=self.asset)
+                if best:
+                    msg = (
+                        f"🔄 Auto-switched to {best.asset}\n"
+                        f"Payout: {best.payout:.0f}% | Trend: {best.trend_direction} {best.trend_score:.0f}\n"
+                        f"Wicks: {best.wick_score:.0f} | Momentum: {best.momentum_score:.0f}"
+                    )
+                    print(f"[SCANNER] Switching → {best.asset} | {best.reason}")
+                    await self._emit_trade_log(msg)
+                    self.asset = best.asset
+                    print("[SCANNER] Asset switched. Continuing scanner loop...")
+                    await asyncio.sleep(2)
+                    continue
                 else:
-                    print("[SCANNER] No asset meets condition.")
-            except AssetSwitchedException:
-                raise
+                    print("[SCANNER] No better asset found. Keeping current.")
+                    await self._emit_trade_log("❌ No better asset found. Keeping current.")
+                    await asyncio.sleep(self.scanner_check_interval)
+
             except asyncio.CancelledError:
+                print("[SCANNER] Scanner loop cancelled.")
                 break
             except Exception as e:
-                print(f"[SCANNER] Error: {e}")
-                await asyncio.sleep(self.scan_interval)
+                print(f"[SCANNER] ERROR in scanner loop: {e}")
+                import traceback
+                traceback.print_exc()
+                await asyncio.sleep(self.scanner_check_interval)
+        print(f"[SCANNER] Scanner loop ENDED. auto_trading={self.auto_trading}")
 
     def start_scanner(self):
+        print(f"[SCANNER] start_scanner called. task_exists={self._scanner_task is not None}, task_done={self._scanner_task.done() if self._scanner_task else 'N/A'}")
         if self.auto_trading and (self._scanner_task is None or self._scanner_task.done()):
+            self._scanner_start_count += 1
+            print(f"[SCANNER] Creating scanner task (start #{self._scanner_start_count})...")
             self._scanner_task = asyncio.create_task(self._scanner_loop())
+            print(f"[SCANNER] Scanner task created: {self._scanner_task}")
+        else:
+            print(f"[SCANNER] Skipping start: auto_trading={self.auto_trading}, task_exists={self._scanner_task is not None}, task_done={self._scanner_task.done() if self._scanner_task else 'N/A'}")
 
     def stop_scanner(self):
+        print(f"[SCANNER] stop_scanner called.")
         if self._scanner_task and not self._scanner_task.done():
             self._scanner_task.cancel()
-            self._scanner_task = None
+            print("[SCANNER] Scanner task cancelled.")
+        self._scanner_task = None

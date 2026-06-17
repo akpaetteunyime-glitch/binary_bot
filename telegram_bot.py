@@ -18,22 +18,32 @@ def _parse_manual_config(text: str) -> dict:
             continue
         key = key.strip().lower()
         value = value.strip()
-        if key in {"amount", "expiry_seconds", "martingale_levels", "martingale_multiplier", "asset", "account_ssid", "ssid", "min_payout", "preferred_assets"}:
+        if key in {"amount", "expiry_seconds", "martingale_levels", "martingale_multiplier", "asset", "account_ssid", "ssid", "min_payout", "preferred_assets", "min_payout_target", "payout_drop_threshold", "max_wick_ratio", "min_trend_score", "scanner_check_interval"}:
             config[key] = value
-    if "ssid" in config and "account_ssid" not in config:
-        config["account_ssid"] = config.pop("ssid")
-    if "amount" in config:
-        config["amount"] = float(config["amount"])
-    if "expiry_seconds" in config:
-        config["expiry_seconds"] = int(config["expiry_seconds"])
-    if "martingale_levels" in config:
-        config["martingale_levels"] = int(config["martingale_levels"])
-    if "martingale_multiplier" in config:
-        config["martingale_multiplier"] = float(config["martingale_multiplier"])
-    if "min_payout" in config:
-        config["min_payout"] = int(config["min_payout"])
-    if "preferred_assets" in config:
-        config["preferred_assets"] = [a.strip() for a in value.replace(" ", ",").split(",") if a.strip()]
+        if "ssid" in config and "account_ssid" not in config:
+            config["account_ssid"] = config.pop("ssid")
+        if "amount" in config:
+            config["amount"] = float(config["amount"])
+        if "expiry_seconds" in config:
+            config["expiry_seconds"] = int(config["expiry_seconds"])
+        if "martingale_levels" in config:
+            config["martingale_levels"] = int(config["martingale_levels"])
+        if "martingale_multiplier" in config:
+            config["martingale_multiplier"] = float(config["martingale_multiplier"])
+        if "min_payout" in config:
+            config["min_payout"] = int(config["min_payout"])
+        if "preferred_assets" in config:
+            config["preferred_assets"] = [a.strip() for a in value.replace(" ", ",").split(",") if a.strip()]
+        if "min_payout_target" in config:
+            config["min_payout_target"] = float(config["min_payout_target"])
+        if "payout_drop_threshold" in config:
+            config["payout_drop_threshold"] = float(config["payout_drop_threshold"])
+        if "max_wick_ratio" in config:
+            config["max_wick_ratio"] = float(config["max_wick_ratio"])
+        if "min_trend_score" in config:
+            config["min_trend_score"] = float(config["min_trend_score"])
+        if "scanner_check_interval" in config:
+            config["scanner_check_interval"] = int(config["scanner_check_interval"])
     return config
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -47,6 +57,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⏱️ SET EXPIRY", callback_data="set_expiry")],
         [InlineKeyboardButton("🎲 CHANGE STRATEGY", callback_data="change_strategy")],
         [InlineKeyboardButton("📅 SET SESSIONS", callback_data="set_sessions")],
+        [InlineKeyboardButton("🔍 ASSET SCANNER", callback_data="scanner_menu")],
         [InlineKeyboardButton("🔐 LINK MY SSID", callback_data="link_ssid")],
         [InlineKeyboardButton("📝 MANUAL CONFIG", callback_data="manual_config")],
         [InlineKeyboardButton("🔄 CHANGE ASSET", callback_data="change_asset")],
@@ -129,7 +140,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.edit_message_text("❌ Failed to set amount")
             except Exception as e:
                 await query.edit_message_text(f"Error: {e}")
-        return
+            return
 
     # ----- Expiry selection -----
     if data == "set_expiry":
@@ -164,7 +175,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.edit_message_text("❌ Failed to set expiry")
             except Exception as e:
                 await query.edit_message_text(f"Error: {e}")
-        return
+            return
 
     # ----- Strategy selection -----
     if data == "change_strategy":
@@ -297,6 +308,108 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"✅ Session start hour set to {hour:02d}:00")
         return
 
+    # ----- Asset Scanner Menu -----
+    if data == "scanner_menu":
+        keyboard = [
+            [InlineKeyboardButton("🟢 ENABLE SCANNER", callback_data="scanner_enable")],
+            [InlineKeyboardButton("🔴 DISABLE SCANNER", callback_data="scanner_disable")],
+            [InlineKeyboardButton("🎯 Payout Target", callback_data="scanner_payout_target")],
+            [InlineKeyboardButton("📉 Drop Threshold", callback_data="scanner_drop_threshold")],
+            [InlineKeyboardButton("🕯️ Max Wick Ratio", callback_data="scanner_wick_ratio")],
+            [InlineKeyboardButton("📈 Min Trend Score", callback_data="scanner_trend_score")],
+            [InlineKeyboardButton("⏱️ Check Interval", callback_data="scanner_interval")],
+            [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")],
+        ]
+        await query.edit_message_text(
+            "🔍 *Asset Scanner Settings*\n"
+            "The bot scans for assets with high payout, smooth momentum, and strong trend.\n"
+            "When the current asset degrades, it auto-switches to the best one found.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if data == "scanner_enable":
+        await session_manager.set_scanner_enabled(user_id, username, True)
+        await query.edit_message_text("✅ Asset scanner ENABLED")
+        return
+    if data == "scanner_disable":
+        await session_manager.set_scanner_enabled(user_id, username, False)
+        await query.edit_message_text("✅ Asset scanner DISABLED")
+        return
+
+    if data == "scanner_payout_target":
+        keyboard = [
+            [InlineKeyboardButton("90%", callback_data="sc_pt_90"), InlineKeyboardButton("92%", callback_data="sc_pt_92")],
+            [InlineKeyboardButton("93%", callback_data="sc_pt_93"), InlineKeyboardButton("95%", callback_data="sc_pt_95")],
+            [InlineKeyboardButton("🔙 Back", callback_data="scanner_menu")],
+        ]
+        await query.edit_message_text("Select minimum payout target:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    if data.startswith("sc_pt_"):
+        val = float(data[6:])
+        await session_manager.set_scanner_settings(user_id, username, min_payout_target=val)
+        await query.edit_message_text(f"✅ Payout target set to {val:.0f}%")
+        return
+
+    if data == "scanner_drop_threshold":
+        keyboard = [
+            [InlineKeyboardButton("80%", callback_data="sc_dt_80"), InlineKeyboardButton("85%", callback_data="sc_dt_85")],
+            [InlineKeyboardButton("88%", callback_data="sc_dt_88"), InlineKeyboardButton("90%", callback_data="sc_dt_90")],
+            [InlineKeyboardButton("🔙 Back", callback_data="scanner_menu")],
+        ]
+        await query.edit_message_text("Select payout drop threshold (switch if below):", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    if data.startswith("sc_dt_"):
+        val = float(data[6:])
+        await session_manager.set_scanner_settings(user_id, username, payout_drop_threshold=val)
+        await query.edit_message_text(f"✅ Drop threshold set to {val:.0f}%")
+        return
+
+    if data == "scanner_wick_ratio":
+        keyboard = [
+            [InlineKeyboardButton("0.15 (strict)", callback_data="sc_wr_0.15")],
+            [InlineKeyboardButton("0.25 (normal)", callback_data="sc_wr_0.25")],
+            [InlineKeyboardButton("0.35 (loose)", callback_data="sc_wr_0.35")],
+            [InlineKeyboardButton("🔙 Back", callback_data="scanner_menu")],
+        ]
+        await query.edit_message_text("Select max wick ratio (lower = smoother candles):", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    if data.startswith("sc_wr_"):
+        val = float(data[6:])
+        await session_manager.set_scanner_settings(user_id, username, max_wick_ratio=val)
+        await query.edit_message_text(f"✅ Max wick ratio set to {val:.2f}")
+        return
+
+    if data == "scanner_trend_score":
+        keyboard = [
+            [InlineKeyboardButton("50 (weak)", callback_data="sc_ts_50")],
+            [InlineKeyboardButton("60 (moderate)", callback_data="sc_ts_60")],
+            [InlineKeyboardButton("75 (strong)", callback_data="sc_ts_75")],
+            [InlineKeyboardButton("🔙 Back", callback_data="scanner_menu")],
+        ]
+        await query.edit_message_text("Select minimum trend strength:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    if data.startswith("sc_ts_"):
+        val = float(data[6:])
+        await session_manager.set_scanner_settings(user_id, username, min_trend_score=val)
+        await query.edit_message_text(f"✅ Min trend score set to {val:.0f}")
+        return
+
+    if data == "scanner_interval":
+        keyboard = [
+            [InlineKeyboardButton("15s", callback_data="sc_int_15"), InlineKeyboardButton("30s", callback_data="sc_int_30")],
+            [InlineKeyboardButton("60s", callback_data="sc_int_60"), InlineKeyboardButton("120s", callback_data="sc_int_120")],
+            [InlineKeyboardButton("🔙 Back", callback_data="scanner_menu")],
+        ]
+        await query.edit_message_text("Select scanner check interval:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    if data.startswith("sc_int_"):
+        val = int(data[7:])
+        await session_manager.set_scanner_settings(user_id, username, check_interval=val)
+        await query.edit_message_text(f"✅ Check interval set to {val}s")
+        return
+
     # ----- Back to main menu -----
     if data == "back_to_main":
         keyboard = [
@@ -309,6 +422,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("⏱️ SET EXPIRY", callback_data="set_expiry")],
             [InlineKeyboardButton("🎲 CHANGE STRATEGY", callback_data="change_strategy")],
             [InlineKeyboardButton("📅 SET SESSIONS", callback_data="set_sessions")],
+            [InlineKeyboardButton("🔍 ASSET SCANNER", callback_data="scanner_menu")],
             [InlineKeyboardButton("🔐 LINK MY SSID", callback_data="link_ssid")],
             [InlineKeyboardButton("📝 MANUAL CONFIG", callback_data="manual_config")],
             [InlineKeyboardButton("🔄 CHANGE ASSET", callback_data="change_asset")],
@@ -376,7 +490,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "manual_config":
         context.user_data["awaiting_input"] = "config"
         await query.edit_message_text(
-            "📝 Send config lines:\nAMOUNT=1.33\nEXPIRY_SECONDS=60\nMARTINGALE_LEVELS=4\nMARTINGALE_MULTIPLIER=2.2\nASSET=GBPUSD_otc\nMIN_PAYOUT=83\nPREFERRED_ASSETS=EURUSD_otc,GBPUSD_otc\nSSID=your_ssid\nUse /cancelconfig to stop."
+            "📝 Send config lines:\n"
+            "AMOUNT=1.33\n"
+            "EXPIRY_SECONDS=60\n"
+            "MARTINGALE_LEVELS=4\n"
+            "MARTINGALE_MULTIPLIER=2.2\n"
+            "ASSET=GBPUSD_otc\n"
+            "MIN_PAYOUT=83\n"
+            "PREFERRED_ASSETS=EURUSD_otc,GBPUSD_otc\n"
+            "MIN_PAYOUT_TARGET=92\n"
+            "PAYOUT_DROP_THRESHOLD=85\n"
+            "MAX_WICK_RATIO=0.25\n"
+            "MIN_TREND_SCORE=60\n"
+            "SCANNER_CHECK_INTERVAL=30\n"
+            "SSID=your_ssid\n"
+            "Use /cancelconfig to stop."
         )
     elif data == "balance":
         try:
@@ -411,7 +539,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"*Sessions/day:* {status['sessions_per_day']}\n"
             f"*Trades/session:* {status['trades_per_session']}\n"
             f"*Start hour:* {status['session_start_hour']:02d}:00\n"
-            f"*Session wins:* {status['session_wins']}"
+            f"*Session wins:* {status['session_wins']}\n"
+            f"*Scanner:* {'🟢 ON' if status['scanner_enabled'] else '🔴 OFF'}\n"
+            f"*Payout Target:* {status['min_payout_target']:.0f}%\n"
+            f"*Drop Threshold:* {status['payout_drop_threshold']:.0f}%\n"
+            f"*Wick Ratio:* {status['max_wick_ratio']:.2f}\n"
+            f"*Trend Score:* {status['min_trend_score']:.0f}\n"
+            f"*Check Interval:* {status['scanner_check_interval']}s"
         )
         await query.edit_message_text(text, parse_mode="Markdown")
 
@@ -435,7 +569,7 @@ async def set_martingale(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def set_payout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /setpayout <percentage>")
+        await update.message.reply_text("Usage: /setpayout <percent>")
         return
     try:
         payout = int(context.args[0])
