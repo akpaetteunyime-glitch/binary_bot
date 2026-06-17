@@ -4,10 +4,8 @@ from datetime import datetime, date, timedelta
 
 from config import AMOUNT, ASSET, EXPIRY_SECONDS, MARTINGALE_LEVELS, MARTINGALE_MULTIPLIER, SCAN_INTERVAL_SECONDS
 
-
 class AssetSwitchedException(Exception):
     pass
-
 
 class TradingEngine:
     def __init__(self, client):
@@ -44,9 +42,8 @@ class TradingEngine:
         self.session_wins = 0
         self.session_index = -1
         self.session_date = None
-        self.on_session_state_changed = None   # callback to update DB
-
-       
+        self.on_session_state_changed = None  # callback to update DB
+        self._all_sessions_done_notified = False  # prevent spam
 
     # ------------------------------------------------------------------
     # Strategy switching
@@ -82,8 +79,8 @@ class TradingEngine:
     def _reset_martingale(self):
         if self.martingale_level != 0:
             print(f"[MARTINGALE] RESET after win: level {self.martingale_level} → 0")
-        self.martingale_level = 0
-        self._notify_level_change()
+            self.martingale_level = 0
+            self._notify_level_change()
 
     def _advance_martingale(self):
         if not self.martingale_enabled:
@@ -245,7 +242,7 @@ class TradingEngine:
                 if self.martingale_enabled:
                     self._reset_martingale()
                 await self._emit_trade_log(self._format_trade_result_win(amount))
-                await self._record_win()   # session win
+                await self._record_win()  # session win
             elif outcome_lower == "draw":
                 print("Draw – no message")
             else:
@@ -277,6 +274,7 @@ class TradingEngine:
     # ------------------------------------------------------------------
     def start_auto_trading(self):
         self.auto_trading = True
+        self._all_sessions_done_notified = False
         self.start_scanner()
         print("✅ Auto trading ENABLED")
 
@@ -304,8 +302,9 @@ class TradingEngine:
         sessions = []
         for i in range(self.sessions_per_day):
             start = base + timedelta(hours=i * gap_hours)
-            end = start + timedelta(minutes=1)   # 1 minute window (but we add 30 seconds grace)
-            sessions.append((start, end + timedelta(seconds=30)))
+            # Each session lasts for the gap duration minus a 5-minute buffer
+            end = start + timedelta(hours=gap_hours) - timedelta(minutes=5)
+            sessions.append((start, end))
         return sessions
 
     def _get_current_session_index(self, dt: datetime):
@@ -317,11 +316,12 @@ class TradingEngine:
         return -1, False
 
     def _reset_session_if_needed(self):
-        today = date.today()
-        if self.session_date != str(today):
+        today = str(date.today())
+        if self.session_date is None or self.session_date != today:
             self.session_wins = 0
             self.session_index = -1
-            self.session_date = str(today)
+            self.session_date = today
+            self._all_sessions_done_notified = False
             self._notify_session_state_changed()
 
     def _notify_session_state_changed(self):
@@ -344,6 +344,13 @@ class TradingEngine:
         if self.session_wins >= self.trades_per_session:
             print(f"[SESSION] Session completed!")
             await self._emit_trade_log(f"✅ Session completed! {self.session_wins} wins reached.")
+            # If this was the last session of the day, stop auto trading
+            if self.session_index == self.sessions_per_day - 1:
+                print("[SESSION] All daily sessions completed. Stopping auto trading.")
+                if not self._all_sessions_done_notified:
+                    await self._emit_trade_log("🏁 All sessions completed for today. Auto trading stopped.")
+                    self._all_sessions_done_notified = True
+                self.stop_auto_trading()
 
     def can_trade(self) -> bool:
         """Check session limits before placing a trade."""
@@ -352,9 +359,14 @@ class TradingEngine:
         dt = datetime.now()
         self._reset_session_if_needed()
         idx, active = self._get_current_session_index(dt)
+
+        # Check if all sessions for today are already done
+        if idx == -1 and self.session_index == self.sessions_per_day - 1 and self.session_wins >= self.trades_per_session:
+            if not self._all_sessions_done_notified:
+                print("[SESSION] All sessions completed for today.")
+            return False
+
         if not active:
-            # Check if we are within the next session's start (to start immediately)
-            # We'll just return False if not active, but we could print a message.
             print("[SESSION] Not in an active session window.")
             return False
         if idx != self.session_index:
@@ -369,7 +381,7 @@ class TradingEngine:
         return True
 
     async def set_session_settings(self, enabled: bool = None, sessions_per_day: int = None,
-                                  trades_per_session: int = None, start_hour: int = None):
+                                   trades_per_session: int = None, start_hour: int = None):
         if enabled is not None:
             self.sessions_enabled = enabled
         if sessions_per_day is not None:
@@ -382,6 +394,7 @@ class TradingEngine:
         self.session_wins = 0
         self.session_index = -1
         self.session_date = str(date.today())
+        self._all_sessions_done_notified = False
         self._notify_session_state_changed()
         print(f"[SESSION] Settings updated: enabled={self.sessions_enabled}, "
               f"sessions={self.sessions_per_day}, trades={self.trades_per_session}, start_hour={self.session_start_hour}")
@@ -519,7 +532,7 @@ class TradingEngine:
                 break
             except Exception as e:
                 print(f"[SCANNER] Error: {e}")
-            await asyncio.sleep(self.scan_interval)
+                await asyncio.sleep(self.scan_interval)
 
     def start_scanner(self):
         if self.auto_trading and (self._scanner_task is None or self._scanner_task.done()):

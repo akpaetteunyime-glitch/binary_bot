@@ -1,10 +1,10 @@
 import sqlite3
 from typing import Any
 from pathlib import Path
+from datetime import date
 
 from config import AMOUNT, ASSET, DATABASE_PATH, EXPIRY_SECONDS, MARTINGALE_LEVELS, MARTINGALE_MULTIPLIER, MIN_PAYOUT, PREFERRED_ASSETS
 from ssid_crypto import SSIDCrypto
-
 
 class UserDatabase:
     def __init__(self, db_path: str = DATABASE_PATH):
@@ -120,7 +120,7 @@ class UserDatabase:
             "session_start_hour": int(fields.get("session_start_hour", current.get("session_start_hour", 7))),
             "session_wins": int(fields.get("session_wins", current.get("session_wins", 0))),
             "session_index": int(fields.get("session_index", current.get("session_index", -1))),
-            "session_date": fields.get("session_date", current.get("session_date")),
+            "session_date": fields.get("session_date", current.get("session_date", str(date.today()))),
         }
 
         if isinstance(payload["preferred_assets"], list):

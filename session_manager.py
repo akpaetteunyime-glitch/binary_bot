@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from dataclasses import dataclass
+import datetime
 from datetime import timedelta, date
 from contextlib import suppress
 
@@ -11,7 +12,6 @@ from database import UserDatabase
 from strategies.candle_strategy import CandleColorStrategy
 from trading_engine import TradingEngine, AssetSwitchedException
 
-
 @dataclass
 class UserSession:
     telegram_user_id: int
@@ -20,52 +20,75 @@ class UserSession:
     engine: TradingEngine
     candle_task: asyncio.Task | None = None
 
-
 class SessionManager:
     def __init__(self, db_path: str | None = None):
         self.db = UserDatabase(db_path) if db_path else UserDatabase()
         self.sessions: dict[int, UserSession] = {}
 
+    # ------------------------------------------------------------------
+    # Safe DB value helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _safe_int(record: dict, key: str, default: int) -> int:
+        val = record.get(key)
+        return int(val) if val is not None else default
+
+    @staticmethod
+    def _safe_float(record: dict, key: str, default: float) -> float:
+        val = record.get(key)
+        return float(val) if val is not None else default
+
+    @staticmethod
+    def _safe_bool(record: dict, key: str, default: bool) -> bool:
+        val = record.get(key)
+        return bool(int(val)) if val is not None else default
+
+    @staticmethod
+    def _safe_str(record: dict, key: str, default: str) -> str:
+        val = record.get(key)
+        return str(val) if val is not None else default
+
     def _apply_record_to_engine(self, engine: TradingEngine, record: dict):
-        engine.asset = record.get("asset") or ASSET
-        engine.base_amount = float(record.get("amount") or AMOUNT)
-        engine.default_expiry = int(record.get("expiry_seconds") or EXPIRY_SECONDS)
-        engine.martingale_levels = int(record.get("martingale_levels") or MARTINGALE_LEVELS)
-        engine.martingale_multiplier = float(record.get("martingale_multiplier") or MARTINGALE_MULTIPLIER)
-        engine.martingale_enabled = bool(record.get("martingale_enabled", 1))
-        engine.martingale_level = int(record.get("martingale_level", 0))
-        engine.daily_loss = float(record.get("daily_loss", 0))
-        engine.trades_today = int(record.get("trades_today", 0))
-        engine.auto_trading = bool(record.get("auto_trading", 0))
-        engine.min_payout = int(record.get("min_payout") or MIN_PAYOUT)
+        engine.asset = self._safe_str(record, "asset", ASSET)
+        engine.base_amount = self._safe_float(record, "amount", AMOUNT)
+        engine.default_expiry = self._safe_int(record, "expiry_seconds", EXPIRY_SECONDS)
+        engine.martingale_levels = self._safe_int(record, "martingale_levels", MARTINGALE_LEVELS)
+        engine.martingale_multiplier = self._safe_float(record, "martingale_multiplier", MARTINGALE_MULTIPLIER)
+        engine.martingale_enabled = self._safe_bool(record, "martingale_enabled", True)
+        engine.martingale_level = self._safe_int(record, "martingale_level", 0)
+        engine.daily_loss = self._safe_float(record, "daily_loss", 0)
+        engine.trades_today = self._safe_int(record, "trades_today", 0)
+        engine.auto_trading = self._safe_bool(record, "auto_trading", False)
+        engine.min_payout = self._safe_int(record, "min_payout", MIN_PAYOUT)
         pa = record.get("preferred_assets")
         if pa:
             if isinstance(pa, str):
                 engine.preferred_assets = [a.strip() for a in pa.split(",") if a.strip()]
             elif isinstance(pa, list):
                 engine.preferred_assets = pa
+            else:
+                engine.preferred_assets = list(PREFERRED_ASSETS)
         else:
             engine.preferred_assets = list(PREFERRED_ASSETS)
+
         # Load strategy
         strat_name = record.get("strategy", "CandleColor")
         engine.set_strategy_by_name(strat_name)
 
-        # Load session settings
-        engine.sessions_enabled = bool(record.get("sessions_enabled", 0))
-        engine.sessions_per_day = int(record.get("sessions_per_day", 3))
-        engine.trades_per_session = int(record.get("trades_per_session", 8))
-        engine.session_start_hour = int(record.get("session_start_hour", 7))
-        engine.session_wins = int(record.get("session_wins", 0))
-        engine.session_index = int(record.get("session_index", -1))
-        engine.session_date = record.get("session_date", str(date.today()))
+        # Load session settings safely
+        engine.sessions_enabled = self._safe_bool(record, "sessions_enabled", False)
+        engine.sessions_per_day = self._safe_int(record, "sessions_per_day", 3)
+        engine.trades_per_session = self._safe_int(record, "trades_per_session", 8)
+        engine.session_start_hour = self._safe_int(record, "session_start_hour", 7)
+        engine.session_wins = self._safe_int(record, "session_wins", 0)
+        engine.session_index = self._safe_int(record, "session_index", -1)
+        engine.session_date = self._safe_str(record, "session_date", str(date.today()))
 
         # Set session state callback to update DB
         engine.on_session_state_changed = lambda wins, idx, dt: self._on_session_state_changed(engine, wins, idx, dt)
 
     async def _on_session_state_changed(self, engine: TradingEngine, wins: int, idx: int, dt: str):
         """Callback from engine to persist session state."""
-        # We need the telegram_user_id. We can find it by iterating sessions or store it in engine.
-        # Let's store telegram_user_id in engine for this purpose.
         if hasattr(engine, '_telegram_user_id'):
             user_id = engine._telegram_user_id
             self.db.update_fields(user_id, session_wins=wins, session_index=idx, session_date=dt)
@@ -78,7 +101,7 @@ class SessionManager:
             client = PocketOptionAsync(ssid=record["ssid"])
             await asyncio.wait_for(client.balance(), timeout=10.0)
             engine = TradingEngine(client)
-            engine._telegram_user_id = telegram_user_id   # store for callback
+            engine._telegram_user_id = telegram_user_id  # store for callback
             engine.set_trade_logger(lambda message: self._notify_user(telegram_user_id, message))
             engine.on_martingale_level_changed = lambda level: self._on_martingale_level_changed(telegram_user_id, level)
             self._apply_record_to_engine(engine, record)
@@ -100,6 +123,9 @@ class SessionManager:
             if username and session.username != username:
                 session.username = username
                 self.db.update_fields(telegram_user_id, username=username)
+            # Ensure _telegram_user_id is always set (in case it was missing)
+            if not hasattr(session.engine, '_telegram_user_id'):
+                session.engine._telegram_user_id = telegram_user_id
             return session
         return await self._create_session(telegram_user_id, username)
 
@@ -186,9 +212,7 @@ class SessionManager:
                     new_asset = await self._find_fallback_asset(session)
                     if new_asset:
                         await self.set_asset(session.telegram_user_id, session.username, new_asset)
-                        retry_count = 0
-                    else:
-                        await asyncio.sleep(30)
+                    retry_count = 0
                 else:
                     await asyncio.sleep(retry_delay)
             except Exception as e:
@@ -236,8 +260,8 @@ class SessionManager:
                 with suppress(asyncio.CancelledError):
                     await session.candle_task
             session.candle_task = None
-        if persist:
-            self.db.update_fields(telegram_user_id, auto_trading=0)
+            if persist:
+                self.db.update_fields(telegram_user_id, auto_trading=0)
 
     # ------------------------------------------------------------------
     # Martingale and other settings
@@ -335,11 +359,58 @@ class SessionManager:
         active_users = []
         with self.db._connect() as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute("SELECT telegram_user_id, username FROM users WHERE auto_trading = 1 AND ssid IS NOT NULL AND ssid != ''").fetchall()
+            rows = conn.execute(
+                "SELECT telegram_user_id, username, sessions_enabled, session_start_hour, "
+                "sessions_per_day, trades_per_session, session_wins, session_index, session_date "
+                "FROM users WHERE auto_trading = 1 AND ssid IS NOT NULL AND ssid != ''"
+            ).fetchall()
             active_users = [dict(row) for row in rows]
         for row in active_users:
             try:
-                await self.start_auto_trading(int(row["telegram_user_id"]), row.get("username"), persist=False)
+                user_id = int(row["telegram_user_id"])
+                username = row.get("username")
+
+                # If sessions are enabled, verify there is an active window before restoring
+                if row.get("sessions_enabled"):
+                    dt = datetime.now()
+                    today = str(date.today())
+                    session_date = row.get("session_date") or today
+                    # If day rolled over, engine will reset state when started
+                    if session_date == today:
+                        sessions_per_day = int(row.get("sessions_per_day", 3)) if row.get("sessions_per_day") is not None else 3
+                        session_start_hour = int(row.get("session_start_hour", 7)) if row.get("session_start_hour") is not None else 7
+                        trades_per_session = int(row.get("trades_per_session", 8)) if row.get("trades_per_session") is not None else 8
+                        session_wins = int(row.get("session_wins", 0)) if row.get("session_wins") is not None else 0
+                        session_index = int(row.get("session_index", -1)) if row.get("session_index") is not None else -1
+
+                        if sessions_per_day == 3:
+                            gap_hours = 5
+                        elif sessions_per_day == 5:
+                            gap_hours = 3
+                        elif sessions_per_day == 15:
+                            gap_hours = 1
+                        else:
+                            gap_hours = 24 // sessions_per_day
+
+                        base = dt.replace(hour=session_start_hour, minute=0, second=0, microsecond=0)
+                        active = False
+                        current_idx = -1
+                        for i in range(sessions_per_day):
+                            start = base + timedelta(hours=i * gap_hours)
+                            end = start + timedelta(hours=gap_hours) - timedelta(minutes=5)
+                            if start <= dt < end:
+                                active = True
+                                current_idx = i
+                                break
+
+                        if not active:
+                            print(f"[RESTORE] User {user_id} has no active session window. Skipping auto-start.")
+                            continue
+                        if current_idx == session_index and session_wins >= trades_per_session:
+                            print(f"[RESTORE] User {user_id} current session already completed. Skipping auto-start.")
+                            continue
+
+                await self.start_auto_trading(user_id, username, persist=False)
             except Exception as e:
                 print(f"Could not restore session for {row['telegram_user_id']}: {e}")
 
@@ -406,7 +477,14 @@ class SessionManager:
             session.engine.session_wins = 0
             session.engine.session_index = -1
             session.engine.session_date = str(date.today())
-            self.db.update_fields(telegram_user_id, username=username, sessions_enabled=int(enabled))
+            self.db.update_fields(
+                telegram_user_id,
+                username=username,
+                sessions_enabled=int(enabled),
+                session_wins=0,
+                session_index=-1,
+                session_date=str(date.today())
+            )
             session.engine._notify_session_state_changed()
         else:
             self.db.update_fields(telegram_user_id, username=username, sessions_enabled=int(enabled))
