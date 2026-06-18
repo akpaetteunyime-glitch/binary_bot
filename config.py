@@ -45,8 +45,23 @@ ASSET_CATEGORIES = {
         "USDSGD_otc", "USDTWD_otc", "USDCNH_otc", "USDHKD_otc", "USDKRW_otc",
         "AUDNZD_otc", "EURNZD_otc", "GBPNZD_otc", "NZDCAD_otc", "CADNOK_otc",
         "EURSEK_otc", "GBPNOK_otc", "AUDCAD_otc", "EURZAR_otc", "USDINR_otc",
-        "USDMYR_otc", "USDPHP_otc", "USDRUB_otc", "USDBRL_otc", "USDCLP_otc"
+        "USDMYR_otc", "USDPHP_otc", "USDRUB_otc", "USDBRL_otc", "USDCLP_otc",
         "AEDCNY_otc", "MADUSD_otc", "BHDCNY_otc", "NGNUSD_otc", "SARCNY_otc",
+        "EGPCNY_otc", "KWDUSD_otc", "OMRCNY_otc", "QARCNY_otc", "SARUSD_otc",
+        "TNDUSD_otc", "ZARCNY_otc", "ARSUSD_otc", "CLPCNY_otc", "COPUSD_otc",
+        "PENUSD_otc", "UYUUSD_otc", "VEFUSD_otc", "VNDUSD_otc", "ZMWUSD_otc",
+        
+        # Forex Exotic & Minor Pairs
+        "GBPZAR_otc", "EURSGD_otc",
+        "USDSGD_otc", "GBPSGD_otc", "EURHKD_otc", "GBPHKD_otc",
+        "GBPSEK_otc", "EURNOK_otc",
+        "EURDKK_otc", "GBPDKK_otc", "EURPLN_otc",
+        "GBPPLN_otc",
+        "USDHUF_otc", "EURILS_otc",
+        "GBPILS_otc", "EURKRW_otc", "GBPKRW_otc", "EURCNH_otc",
+        "GBPCNH_otc", "EURTHB_otc", "GBPTHB_otc",
+        "EURRUB_otc", "GBPRUB_otc", "EURINR_otc",
+        "GBPINR_otc", "EURBRL_otc", "GBPBRL_otc",
     ],
     "Forex Real": [
         "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD",
@@ -93,6 +108,19 @@ ASSET_CATEGORIES = {
         "US30", "US500", "USTEC", "GER30", "UK100",
         "FRA40", "EUR50", "JPN225", "AUS200", "CHN50",
         "HK50", "INDIA50", "NAS100", "SPX500", "DAX30"
+    ],
+    "Commodities OTC": [
+        # Commodities & Metals
+        "XAUUSD_otc",      # Gold
+        "XAGUSD_otc",      # Silver
+        "XPTUSD_otc",      # Platinum
+        "XPDUSD_otc",      # Palladium
+        "USOIL_otc",       # WTI Crude Oil
+        "UKOIL_otc",       # Brent Crude Oil
+        "NGAS_otc",        # Natural Gas
+        "COPPER_otc",      # Copper
+        "ALUMINIUM_otc",   # Aluminium
+        "ZINC_otc",        # Zinc
     ]
 }
 

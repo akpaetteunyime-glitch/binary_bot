@@ -44,9 +44,11 @@ class TradingEngine:
         self.session_wins = 0
         self.session_index = -1
         self.session_date = None
-        self.on_session_state_changed = None   # callback to update DB
+        self.on_session_state_changed = None
 
-       
+        # Rest‑one‑candle flag (default: True)
+        self.rest_one_candle = True
+        self._skip_next_candle = False
 
     # ------------------------------------------------------------------
     # Strategy switching
@@ -278,11 +280,14 @@ class TradingEngine:
     def start_auto_trading(self):
         self.auto_trading = True
         self.start_scanner()
+        # Reset the skip flag when starting auto trading
+        self._skip_next_candle = False
         print("✅ Auto trading ENABLED")
 
     def stop_auto_trading(self):
         self.auto_trading = False
         self.stop_scanner()
+        asyncio.create_task(self.cancel_pending_result_tasks())
         print("⏹️ Auto trading DISABLED")
 
     # ------------------------------------------------------------------
@@ -353,12 +358,9 @@ class TradingEngine:
         self._reset_session_if_needed()
         idx, active = self._get_current_session_index(dt)
         if not active:
-            # Check if we are within the next session's start (to start immediately)
-            # We'll just return False if not active, but we could print a message.
             print("[SESSION] Not in an active session window.")
             return False
         if idx != self.session_index:
-            # New session – reset wins
             self.session_wins = 0
             self.session_index = idx
             self._notify_session_state_changed()
@@ -387,12 +389,22 @@ class TradingEngine:
               f"sessions={self.sessions_per_day}, trades={self.trades_per_session}, start_hour={self.session_start_hour}")
 
     # ------------------------------------------------------------------
+    # Rest‑one‑candle toggle
+    # ------------------------------------------------------------------
+    def set_rest_one_candle(self, enabled: bool):
+        """Enable or disable the rest‑one‑candle pattern."""
+        self.rest_one_candle = enabled
+        # Reset the skip flag when toggling
+        self._skip_next_candle = False
+        print(f"[REST] Rest‑one‑candle is now {'ON' if enabled else 'OFF'}")
+
+    # ------------------------------------------------------------------
     # Trade execution
     # ------------------------------------------------------------------
     async def place_trade(self, direction: str, manual: bool = False, expiry: int | None = None) -> bool:
         if not manual and not self.auto_trading:
+            print("❌ place_trade: auto_trading is off")
             return False
-        # Session check for auto trades only
         if not manual and not self.can_trade():
             await self._emit_trade_log("⏸️ Trading paused: session limit reached or not in session.")
             return False
@@ -400,6 +412,7 @@ class TradingEngine:
             expiry_value = expiry or self.default_expiry
             amount = self.base_amount if manual else self.get_current_trade_amount()
             dir_up = direction.upper()
+            print(f"🔄 Placing {dir_up} for {self.asset}, amount ${amount:.2f}, expiry {expiry_value}s at {datetime.now().strftime('%H:%M:%S')}")
             if dir_up == "CALL":
                 trade_id, _ = await self.client.buy(self.asset, amount, expiry_value)
             elif dir_up == "PUT":
@@ -436,25 +449,38 @@ class TradingEngine:
         print(f"[MANUAL] Expiry set to {expiry}s")
 
     # ------------------------------------------------------------------
-    # Candle handling
+    # Candle handling – Immediate execution with rest‑one‑candle logic
     # ------------------------------------------------------------------
     async def on_candle(self, candle: dict):
         if not self.auto_trading or not self.strategy:
-            return
-        if not self._result_ready_event.is_set():
-            print("[CANDLE] Waiting for previous trade result")
+            print("[CANDLE] Auto trading off or no strategy.")
             return
 
-        ts = candle.get('time') or candle.get('timestamp')
-        if ts is None:
-            self.last_candle_time = datetime.now()
-        else:
-            if isinstance(ts, (int, float)):
-                self.last_candle_time = datetime.fromtimestamp(ts)
+        # Get signal from the closed candle
+        signal = await self.strategy.get_signal(candle)
+        if signal is None:
+            print("[CANDLE] No signal from strategy.")
+            return
+
+        print(f"[CANDLE] Signal: {signal}")
+
+        # --- Rest‑one‑candle logic ---
+        if self.rest_one_candle:
+            if self._skip_next_candle:
+                print(f"[CANDLE] Skipping trade (resting this candle).")
+                self._skip_next_candle = False   # reset for the next candle
+                # Still store candle time for data collectors (optional)
+                self._store_candle_time(candle)
+                return
             else:
-                self.last_candle_time = ts
+                # We will trade now, and set the flag to skip the next one
+                self._skip_next_candle = True
+                print(f"[CANDLE] Trading on this candle; next candle will be skipped.")
+        else:
+            # No resting – trade on every candle
+            self._skip_next_candle = False
 
-        # Determine expiry: use custom if set, else strategy's default
+        # Determine expiry
         if self.custom_expiry_set:
             expiry = self.default_expiry
         else:
@@ -464,14 +490,21 @@ class TradingEngine:
             else:
                 expiry = self.default_expiry
 
-        signal = await self.strategy.get_signal(candle)
-        if signal:
-            self._result_ready_event.clear()
-            try:
-                await self.place_trade(signal, manual=False, expiry=expiry)
-            except Exception as e:
-                print(f"[CANDLE] Trade error: {e}")
-                self._result_ready_event.set()
+        # Place trade immediately (on the currently open candle)
+        await self.place_trade(signal, manual=False, expiry=expiry)
+
+        # Store candle time for data collectors
+        self._store_candle_time(candle)
+
+    def _store_candle_time(self, candle: dict):
+        ts = candle.get('time') or candle.get('timestamp')
+        if ts is not None:
+            if isinstance(ts, (int, float)):
+                self.last_candle_time = datetime.fromtimestamp(ts)
+            else:
+                self.last_candle_time = ts
+        else:
+            self.last_candle_time = datetime.now()
 
     # ------------------------------------------------------------------
     # Scanner for EMARSI
