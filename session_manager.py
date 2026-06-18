@@ -1,7 +1,7 @@
 import asyncio
 import sqlite3
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import timedelta, date
 from contextlib import suppress
 
 from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
@@ -46,9 +46,29 @@ class SessionManager:
                 engine.preferred_assets = pa
         else:
             engine.preferred_assets = list(PREFERRED_ASSETS)
-        # Load strategy from database
+        # Load strategy
         strat_name = record.get("strategy", "CandleColor")
         engine.set_strategy_by_name(strat_name)
+
+        # Load session settings
+        engine.sessions_enabled = bool(record.get("sessions_enabled", 0))
+        engine.sessions_per_day = int(record.get("sessions_per_day", 3))
+        engine.trades_per_session = int(record.get("trades_per_session", 8))
+        engine.session_start_hour = int(record.get("session_start_hour", 7))
+        engine.session_wins = int(record.get("session_wins", 0))
+        engine.session_index = int(record.get("session_index", -1))
+        engine.session_date = record.get("session_date", str(date.today()))
+
+        # Set session state callback to update DB
+        engine.on_session_state_changed = lambda wins, idx, dt: self._on_session_state_changed(engine, wins, idx, dt)
+
+    async def _on_session_state_changed(self, engine: TradingEngine, wins: int, idx: int, dt: str):
+        """Callback from engine to persist session state."""
+        # We need the telegram_user_id. We can find it by iterating sessions or store it in engine.
+        # Let's store telegram_user_id in engine for this purpose.
+        if hasattr(engine, '_telegram_user_id'):
+            user_id = engine._telegram_user_id
+            self.db.update_fields(user_id, session_wins=wins, session_index=idx, session_date=dt)
 
     async def _create_session(self, telegram_user_id: int, username: str | None = None) -> UserSession | None:
         record = self.db.get_user(telegram_user_id)
@@ -58,6 +78,7 @@ class SessionManager:
             client = PocketOptionAsync(ssid=record["ssid"])
             await asyncio.wait_for(client.balance(), timeout=10.0)
             engine = TradingEngine(client)
+            engine._telegram_user_id = telegram_user_id   # store for callback
             engine.set_trade_logger(lambda message: self._notify_user(telegram_user_id, message))
             engine.on_martingale_level_changed = lambda level: self._on_martingale_level_changed(telegram_user_id, level)
             self._apply_record_to_engine(engine, record)
@@ -155,9 +176,8 @@ class SessionManager:
                     print(f"Candle for {session.telegram_user_id}: O={candle.get('open')} C={candle.get('close')}")
                     await session.engine.on_candle(candle)
             except AssetSwitchedException as e:
-                # Scanner switched asset – break to restart subscription with new asset
                 print(f"[CANDLE] Asset switched to {e.args[0] if e.args else '?'}. Restarting subscription.")
-                continue   # go to next while iteration, re-subscribe with new asset
+                continue
             except asyncio.TimeoutError:
                 retry_count += 1
                 print(f"[CANDLE] Subscription timeout for {session.engine.asset} (attempt {retry_count}/{max_retries})")
@@ -219,6 +239,9 @@ class SessionManager:
         if persist:
             self.db.update_fields(telegram_user_id, auto_trading=0)
 
+    # ------------------------------------------------------------------
+    # Martingale and other settings
+    # ------------------------------------------------------------------
     async def toggle_martingale(self, telegram_user_id: int, username: str | None = None) -> bool:
         session = await self.ensure_session(telegram_user_id, username)
         if session is None:
@@ -300,6 +323,12 @@ class SessionManager:
             "min_payout": session.engine.min_payout if session else int(record.get("min_payout", MIN_PAYOUT)),
             "preferred_assets": session.engine.preferred_assets if session else (record.get("preferred_assets") or PREFERRED_ASSETS),
             "strategy": session.engine.strategy_name if session else record.get("strategy", "CandleColor"),
+            "sessions_enabled": session.engine.sessions_enabled if session else bool(record.get("sessions_enabled", 0)),
+            "sessions_per_day": session.engine.sessions_per_day if session else int(record.get("sessions_per_day", 3)),
+            "trades_per_session": session.engine.trades_per_session if session else int(record.get("trades_per_session", 8)),
+            "session_start_hour": session.engine.session_start_hour if session else int(record.get("session_start_hour", 7)),
+            "session_wins": session.engine.session_wins if session else int(record.get("session_wins", 0)),
+            "session_date": session.engine.session_date if session else record.get("session_date", str(date.today())),
         }
 
     async def restore_auto_sessions(self):
@@ -320,6 +349,9 @@ class SessionManager:
         except Exception as e:
             print(f"[SESSION] DB error: {e}")
 
+    # ------------------------------------------------------------------
+    # Asset, Amount, Expiry
+    # ------------------------------------------------------------------
     async def set_asset(self, telegram_user_id: int, username: str | None, new_asset: str) -> bool:
         session = await self.ensure_session(telegram_user_id, username)
         if session is None:
@@ -343,7 +375,7 @@ class SessionManager:
         session = await self.ensure_session(telegram_user_id, username)
         if session is None:
             raise ValueError("Link your SSID first")
-        session.engine.default_expiry = expiry_seconds
+        await session.engine.set_default_expiry(expiry_seconds)
         self.db.update_fields(telegram_user_id, username=username, expiry_seconds=expiry_seconds)
         await self._notify_user(telegram_user_id, f"✅ Expiry time set to {expiry_seconds} seconds")
         return True
@@ -360,3 +392,52 @@ class SessionManager:
         except Exception as e:
             await self._notify_user(telegram_user_id, f"❌ Failed to change strategy: {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # Session scheduling settings
+    # ------------------------------------------------------------------
+    async def set_sessions_enabled(self, telegram_user_id: int, username: str | None, enabled: bool) -> bool:
+        session = await self.ensure_session(telegram_user_id, username)
+        if session is None:
+            raise ValueError("Link your SSID first")
+        session.engine.sessions_enabled = enabled
+        if not enabled:
+            # reset session state
+            session.engine.session_wins = 0
+            session.engine.session_index = -1
+            session.engine.session_date = str(date.today())
+            self.db.update_fields(telegram_user_id, username=username, sessions_enabled=int(enabled))
+            session.engine._notify_session_state_changed()
+        else:
+            self.db.update_fields(telegram_user_id, username=username, sessions_enabled=int(enabled))
+        await self._notify_user(telegram_user_id, f"✅ Session scheduling {'ENABLED' if enabled else 'DISABLED'}")
+        return True
+
+    async def set_session_schedule(self, telegram_user_id: int, username: str | None, sessions_per_day: int = None, trades_per_session: int = None, start_hour: int = None) -> bool:
+        session = await self.ensure_session(telegram_user_id, username)
+        if session is None:
+            raise ValueError("Link your SSID first")
+        if sessions_per_day is not None:
+            session.engine.sessions_per_day = sessions_per_day
+        if trades_per_session is not None:
+            session.engine.trades_per_session = trades_per_session
+        if start_hour is not None:
+            session.engine.session_start_hour = start_hour
+        # Reset session state
+        session.engine.session_wins = 0
+        session.engine.session_index = -1
+        session.engine.session_date = str(date.today())
+        session.engine._notify_session_state_changed()
+        update_fields = {}
+        if sessions_per_day is not None:
+            update_fields["sessions_per_day"] = sessions_per_day
+        if trades_per_session is not None:
+            update_fields["trades_per_session"] = trades_per_session
+        if start_hour is not None:
+            update_fields["session_start_hour"] = start_hour
+        update_fields["session_wins"] = 0
+        update_fields["session_index"] = -1
+        update_fields["session_date"] = str(date.today())
+        self.db.update_fields(telegram_user_id, username=username, **update_fields)
+        await self._notify_user(telegram_user_id, f"✅ Schedule updated: {session.engine.sessions_per_day} sessions, {session.engine.trades_per_session} wins per session, start at {session.engine.session_start_hour:02d}:00")
+        return True

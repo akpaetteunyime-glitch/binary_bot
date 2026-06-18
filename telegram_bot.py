@@ -1,5 +1,6 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+from config import ASSET_CATEGORIES
 
 session_manager = None
 
@@ -45,6 +46,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💰 SET AMOUNT", callback_data="set_amount")],
         [InlineKeyboardButton("⏱️ SET EXPIRY", callback_data="set_expiry")],
         [InlineKeyboardButton("🎲 CHANGE STRATEGY", callback_data="change_strategy")],
+        [InlineKeyboardButton("📅 SET SESSIONS", callback_data="set_sessions")],
         [InlineKeyboardButton("🔐 LINK MY SSID", callback_data="link_ssid")],
         [InlineKeyboardButton("📝 MANUAL CONFIG", callback_data="manual_config")],
         [InlineKeyboardButton("🔄 CHANGE ASSET", callback_data="change_asset")],
@@ -72,7 +74,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Session manager not ready.")
         return
 
-    # Asset selection
+    # ----- Asset selection (from category drill-down) -----
     if data.startswith("asset_"):
         asset = data[6:]
         try:
@@ -85,7 +87,32 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"Error: {e}")
         return
 
-    # Amount selection
+    # ----- Category selection -----
+    if data.startswith("cat_"):
+        category = data[4:]
+        assets = ASSET_CATEGORIES.get(category, [])
+        if not assets:
+            await query.edit_message_text("No assets in this category.")
+            return
+        rows = []
+        row = []
+        for asset in assets:
+            row.append(InlineKeyboardButton(asset, callback_data=f"asset_{asset}"))
+            if len(row) == 4:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("🔙 Categories", callback_data="change_asset")])
+        rows.append([InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")])
+        await query.edit_message_text(
+            f"📊 *{category} – select asset*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+
+    # ----- Amount selection -----
     if data.startswith("amount_"):
         val = data[7:]
         if val == "custom":
@@ -104,7 +131,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"Error: {e}")
         return
 
-    # Expiry selection
+    # ----- Expiry selection -----
     if data == "set_expiry":
         keyboard = [
             [InlineKeyboardButton("15s", callback_data="expiry_15"),
@@ -139,13 +166,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"Error: {e}")
         return
 
-    # Strategy selection
+    # ----- Strategy selection -----
     if data == "change_strategy":
         keyboard = [
             [InlineKeyboardButton("🌈 Candle Color", callback_data="strategy_CandleColor")],
             [InlineKeyboardButton("📈 MA Crossover", callback_data="strategy_MACrossover")],
             [InlineKeyboardButton("⏰ Time Stat Arbitrage", callback_data="strategy_TimeStatArbitrage")],
-            [InlineKeyboardButton("📊 3 EMA + RSI", callback_data="strategy_EMARSI")],   # NEW BUTTON
+            [InlineKeyboardButton("📊 3 EMA + RSI", callback_data="strategy_EMARSI")],
+            [InlineKeyboardButton("🔄 Rotational", callback_data="strategy_Rotational")],
             [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")],
         ]
         await query.edit_message_text(
@@ -155,7 +183,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if data.startswith("strategy_"):
-        strat = data[9:]   # remove "strategy_"
+        strat = data[9:]
         try:
             success = await session_manager.set_strategy(user_id, username, strat)
             if success:
@@ -166,7 +194,110 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"Error: {e}")
         return
 
-    # Back to main menu
+    # ----- Change Asset (show categories) -----
+    if data == "change_asset":
+        rows = []
+        row = []
+        for category in ASSET_CATEGORIES.keys():
+            row.append(InlineKeyboardButton(category, callback_data=f"cat_{category}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")])
+        await query.edit_message_text(
+            "📊 *Select asset category*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+
+    # ----- Session scheduling -----
+    if data == "set_sessions":
+        keyboard = [
+            [InlineKeyboardButton("🔘 ENABLE SESSIONS", callback_data="sessions_enable")],
+            [InlineKeyboardButton("🔴 DISABLE SESSIONS", callback_data="sessions_disable")],
+            [InlineKeyboardButton("📊 Sessions per day", callback_data="sessions_per_day")],
+            [InlineKeyboardButton("🕒 Start hour", callback_data="session_start_hour")],
+            [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")],
+        ]
+        await query.edit_message_text(
+            "📅 *Session Scheduling Settings*\n"
+            "Set number of sessions per day, trades per session, and start hour.\n"
+            "Sessions: 3 (gap 5h), 5 (gap 3h), 15 (gap 1h).",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if data == "sessions_enable":
+        await session_manager.set_sessions_enabled(user_id, username, True)
+        await query.edit_message_text("✅ Session scheduling ENABLED")
+        return
+    if data == "sessions_disable":
+        await session_manager.set_sessions_enabled(user_id, username, False)
+        await query.edit_message_text("✅ Session scheduling DISABLED")
+        return
+
+    if data == "sessions_per_day":
+        keyboard = [
+            [InlineKeyboardButton("3 sessions (8,9,10 wins)", callback_data="sess_preset_3")],
+            [InlineKeyboardButton("5 sessions (4,5,6 wins)", callback_data="sess_preset_5")],
+            [InlineKeyboardButton("15 sessions (1,2,3 wins)", callback_data="sess_preset_15")],
+            [InlineKeyboardButton("🔙 Back", callback_data="set_sessions")],
+        ]
+        await query.edit_message_text("Select sessions per day:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("sess_preset_"):
+        val = data[12:]  # '3', '5', '15'
+        sessions = int(val)
+        if sessions == 3:
+            choices = [8,9,10]
+        elif sessions == 5:
+            choices = [4,5,6]
+        elif sessions == 15:
+            choices = [1,2,3]
+        else:
+            await query.edit_message_text("Invalid selection")
+            return
+        keyboard = []
+        for t in choices:
+            keyboard.append([InlineKeyboardButton(f"{t} wins/session", callback_data=f"sess_set_{sessions}_{t}")])
+        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="sessions_per_day")])
+        await query.edit_message_text(f"Select trades per session for {sessions} sessions/day:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("sess_set_"):
+        parts = data[9:].split('_')
+        sessions = int(parts[0])
+        trades = int(parts[1])
+        await session_manager.set_session_schedule(user_id, username, sessions_per_day=sessions, trades_per_session=trades)
+        await query.edit_message_text(f"✅ Sessions per day: {sessions}, trades per session: {trades}")
+        return
+
+    if data == "session_start_hour":
+        rows = []
+        row = []
+        for h in range(24):
+            row.append(InlineKeyboardButton(f"{h:02d}:00", callback_data=f"sess_hour_{h}"))
+            if len(row) == 6:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="set_sessions")])
+        await query.edit_message_text("Select session start hour (24h format):", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("sess_hour_"):
+        hour = int(data[10:])
+        await session_manager.set_session_schedule(user_id, username, start_hour=hour)
+        await query.edit_message_text(f"✅ Session start hour set to {hour:02d}:00")
+        return
+
+    # ----- Back to main menu -----
     if data == "back_to_main":
         keyboard = [
             [InlineKeyboardButton("🟢 AUTO TRADING ON", callback_data="auto_on")],
@@ -177,6 +308,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("💰 SET AMOUNT", callback_data="set_amount")],
             [InlineKeyboardButton("⏱️ SET EXPIRY", callback_data="set_expiry")],
             [InlineKeyboardButton("🎲 CHANGE STRATEGY", callback_data="change_strategy")],
+            [InlineKeyboardButton("📅 SET SESSIONS", callback_data="set_sessions")],
             [InlineKeyboardButton("🔐 LINK MY SSID", callback_data="link_ssid")],
             [InlineKeyboardButton("📝 MANUAL CONFIG", callback_data="manual_config")],
             [InlineKeyboardButton("🔄 CHANGE ASSET", callback_data="change_asset")],
@@ -192,7 +324,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Set amount menu
+    # ----- Set amount menu -----
     if data == "set_amount":
         keyboard = [
             [InlineKeyboardButton("$1", callback_data="amount_1"),
@@ -211,7 +343,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Existing handlers (auto_on, auto_off, martingale, presets, etc.)
+    # ----- Existing handlers (auto_on, auto_off, martingale, presets, etc.) -----
     if data == "auto_on":
         try:
             await session_manager.start_auto_trading(user_id, username)
@@ -246,30 +378,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📝 Send config lines:\nAMOUNT=1.33\nEXPIRY_SECONDS=60\nMARTINGALE_LEVELS=4\nMARTINGALE_MULTIPLIER=2.2\nASSET=GBPUSD_otc\nMIN_PAYOUT=83\nPREFERRED_ASSETS=EURUSD_otc,GBPUSD_otc\nSSID=your_ssid\nUse /cancelconfig to stop."
         )
-    elif data == "change_asset":
-        session = await session_manager.ensure_session(user_id, username)
-        if not session:
-            await query.edit_message_text("Please link SSID first.")
-            return
-        assets = session.engine.preferred_assets
-        if not assets:
-            await query.edit_message_text("No preferred assets. Use MANUAL CONFIG to add.")
-            return
-        rows = []
-        row = []
-        for asset in assets:
-            row.append(InlineKeyboardButton(asset, callback_data=f"asset_{asset}"))
-            if len(row) == 4:
-                rows.append(row)
-                row = []
-        if row:
-            rows.append(row)
-        rows.append([InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")])
-        await query.edit_message_text(
-            "📊 *Select asset*\n(Martingale level preserved)",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(rows)
-        )
     elif data == "balance":
         try:
             bal = await session_manager.get_balance(user_id)
@@ -298,11 +406,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"*Base Amount:* ${status['base_amount']:.2f}\n"
             f"*Default Expiry:* {status['default_expiry']}s\n"
             f"*Daily Loss:* ${status['daily_loss']:.2f}\n"
-            f"*Strategy:* {status.get('strategy', 'CandleColor')}"
+            f"*Strategy:* {status['strategy']}\n"
+            f"*Sessions:* {'Enabled' if status['sessions_enabled'] else 'Disabled'}\n"
+            f"*Sessions/day:* {status['sessions_per_day']}\n"
+            f"*Trades/session:* {status['trades_per_session']}\n"
+            f"*Start hour:* {status['session_start_hour']:02d}:00\n"
+            f"*Session wins:* {status['session_wins']}"
         )
         await query.edit_message_text(text, parse_mode="Markdown")
 
-# ----- Command handlers -----
+# ----- Command handlers (unchanged) -----
 async def martingale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     enabled = await session_manager.toggle_martingale(update.effective_user.id, update.effective_user.username)
     state = "enabled" if enabled else "disabled"
