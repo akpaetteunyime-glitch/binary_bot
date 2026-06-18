@@ -42,7 +42,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🔴 AUTO TRADING OFF", callback_data="auto_off")],
         [InlineKeyboardButton("⚙️ MARTINGALE TOGGLE", callback_data="martingale_toggle")],
         [InlineKeyboardButton("🛑 MARTINGALE OFF", callback_data="martingale_off")],
-        [InlineKeyboardButton("4 LVL / 2.2x", callback_data="preset_4_22"), InlineKeyboardButton("6 LVL / 2.5x", callback_data="preset_6_25")],
+        # NEW: single button to set martingale levels
+        [InlineKeyboardButton("📊 SET MARTINGALE LEVEL", callback_data="martingale_set")],
         [InlineKeyboardButton("💰 SET AMOUNT", callback_data="set_amount")],
         [InlineKeyboardButton("⏱️ SET EXPIRY", callback_data="set_expiry")],
         [InlineKeyboardButton("🎲 CHANGE STRATEGY", callback_data="change_strategy")],
@@ -304,7 +305,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🔴 AUTO TRADING OFF", callback_data="auto_off")],
             [InlineKeyboardButton("⚙️ MARTINGALE TOGGLE", callback_data="martingale_toggle")],
             [InlineKeyboardButton("🛑 MARTINGALE OFF", callback_data="martingale_off")],
-            [InlineKeyboardButton("4 LVL / 2.2x", callback_data="preset_4_22"), InlineKeyboardButton("6 LVL / 2.5x", callback_data="preset_6_25")],
+            [InlineKeyboardButton("📊 SET MARTINGALE LEVEL", callback_data="martingale_set")],
             [InlineKeyboardButton("💰 SET AMOUNT", callback_data="set_amount")],
             [InlineKeyboardButton("⏱️ SET EXPIRY", callback_data="set_expiry")],
             [InlineKeyboardButton("🎲 CHANGE STRATEGY", callback_data="change_strategy")],
@@ -343,7 +344,48 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ----- Existing handlers (auto_on, auto_off, martingale, presets, etc.) -----
+    # ----- NEW: Martingale level selection menu -----
+    if data == "martingale_set":
+        keyboard = [
+            [InlineKeyboardButton("2 Hands", callback_data="martingale_level_2")],
+            [InlineKeyboardButton("3 Hands", callback_data="martingale_level_3")],
+            [InlineKeyboardButton("4 Hands", callback_data="martingale_level_4")],
+            [InlineKeyboardButton("5 Hands", callback_data="martingale_level_5")],
+            [InlineKeyboardButton("✏️ Custom (enter number)", callback_data="martingale_custom")],
+            [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")],
+        ]
+        await query.edit_message_text(
+            "📊 *Select Martingale Levels*\n"
+            "Multiplier is fixed at **2.2x**.\n"
+            "Choose a preset or enter a custom level.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    if data.startswith("martingale_level_"):
+        level_str = data[17:]  # after "martingale_level_"
+        try:
+            levels = int(level_str)
+            # Set levels and multiplier 2.2, then enable martingale
+            await session_manager.set_martingale_settings(user_id, username, levels=levels, multiplier=2.2)
+            await session_manager.enable_martingale(user_id, username)
+            await query.edit_message_text(f"✅ Martingale set to {levels} levels with 2.2x multiplier.")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {e}")
+        return
+
+    if data == "martingale_custom":
+        context.user_data["awaiting_input"] = "custom_martingale_level"
+        await query.edit_message_text(
+            "✏️ Send the number of martingale levels you want.\n"
+            "Example: `4` for 4 levels.\n"
+            "The multiplier will be **2.2x**.\n"
+            "Use /cancelconfig to cancel."
+        )
+        return
+
+    # ----- Existing handlers (auto_on, auto_off, martingale, etc.) -----
     if data == "auto_on":
         try:
             await session_manager.start_auto_trading(user_id, username)
@@ -360,14 +402,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "martingale_off":
         await session_manager.disable_martingale(user_id, username)
         await query.edit_message_text("🛑 *Martingale DISABLED and reset*", parse_mode="Markdown")
-    elif data == "preset_4_22":
-        await session_manager.set_martingale_settings(user_id, username, levels=4, multiplier=2.2)
-        await session_manager.enable_martingale(user_id, username)
-        await query.edit_message_text("⚙️ *Martingale preset applied: 4 levels, 2.2x*", parse_mode="Markdown")
-    elif data == "preset_6_25":
-        await session_manager.set_martingale_settings(user_id, username, levels=6, multiplier=2.5)
-        await session_manager.enable_martingale(user_id, username)
-        await query.edit_message_text("⚙️ *Martingale preset applied: 6 levels, 2.5x*", parse_mode="Markdown")
     elif data == "link_ssid":
         context.user_data["awaiting_input"] = "ssid"
         await query.edit_message_text(
@@ -495,6 +529,22 @@ async def manual_config_input(update: Update, context: ContextTypes.DEFAULT_TYPE
                 await update.message.reply_text(f"✅ Expiry set to {expiry}s")
             else:
                 await update.message.reply_text("❌ Failed to set expiry")
+            return
+        # NEW: custom martingale level input
+        if mode == "custom_martingale_level":
+            try:
+                levels = int(text)
+                if levels <= 0:
+                    raise ValueError("Level must be a positive integer.")
+                await session_manager.set_martingale_settings(user.id, user.username, levels=levels, multiplier=2.2)
+                await session_manager.enable_martingale(user.id, user.username)
+                context.user_data.pop("awaiting_input", None)
+                await update.message.reply_text(f"✅ Martingale set to {levels} hands with 2.2x multiplier.")
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Invalid input. Please enter a **positive integer** (e.g., 2, 3, 4, 5, 10).\n"
+                    "Use /cancelconfig to cancel."
+                )
             return
         parsed = _parse_manual_config(text)
         if not parsed:
